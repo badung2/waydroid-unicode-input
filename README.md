@@ -2,7 +2,9 @@
 
 **Secure Windows Remote Desktop access to Waydroid Android, with Korean/Unicode keyboard composition, per-server username/password (NLA) authentication, and prebuilt ARM64 Weston binaries.**
 
-[🇰🇷 한국어 전체 사용 설명서](README.ko.md) · [Licenses & attribution](NOTICE.md) · [Security](SECURITY.md) · [Detailed troubleshooting](docs/TROUBLESHOOTING.en.md)
+[![한국어](https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-0969da?style=for-the-badge)](README.ko.md) [![English](https://img.shields.io/badge/English-0969da?style=for-the-badge)](README.md)
+
+[Licenses & attribution](NOTICE.md) · [Security](SECURITY.md) · [Detailed troubleshooting](docs/TROUBLESHOOTING.en.md)
 
 > **This project ships:** patched Weston source (as a patch against official Weston 16.0.2), precompiled ARM64 Weston, custom PickleIME Android APK and Java source, a Python RDP→Android keyboard relay, deployment/verification scripts.
 >
