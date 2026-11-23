@@ -4,17 +4,17 @@
 
 [English README](README.md) · [라이선스/출처](NOTICE.md) · [보안](SECURITY.md) · [고급 문제 해결](docs/TROUBLESHOOTING.ko.md)
 
-> **배포 범위:** Weston 패치 소스, 한글 입력 브리지, PickleIME Android 앱 소스·APK, 검증된 ARM64용 Weston 빌드, 설정·검증 스크립트. **Waydroid 프로그램·Android 운영체제 이미지·Google 앱은 포함하지 않아.**
+> **배포 범위:** Weston 패치 소스, 한글 입력 브리지, PickleIME Android 앱 소스·APK, 검증된 ARM64용 Weston 빌드, 설정·검증 스크립트. **Waydroid 프로그램·Android 운영체제 이미지·Google 앱은 포함하지 않습니다.**
 >
-> **호환성:** 사전 빌드한 바이너리는 **Ubuntu 26.04.1 LTS / ARM64(aarch64)**용이야. Waydroid 1.6.3 / Android 13, Weston 16.0.2 / FreeRDP 3.32.2 기반에서 제작했어. 다른 환경은 패치를 적용한 후 별도로 빌드해야 할 수 있어.
+> **호환성:** 사전 빌드한 바이너리는 **Ubuntu 26.04.1 LTS / ARM64(aarch64)**용입니다. Waydroid 1.6.3 / Android 13, Weston 16.0.2 / FreeRDP 3.32.2 기반에서 제작했습니다. 다른 환경에서는 패치를 적용한 후 별도로 빌드해야 할 수 있습니다.
 >
-> **검증 범위:** 기존 OCI 서버에서는 Android 입력 테스트 14/14, 운영 전환 검증 4/4가 통과했어. 공개용 패치를 공식 Weston 원본에 적용하는 시험과 공개용 바이너리의 빌드·버전 확인은 했지만, **완전히 새로운 빈 VM에서 설치 스크립트를 처음부터 끝까지 검증한 건 아니야.**
+> **검증 범위:** 기존 OCI 서버에서 Android 입력 테스트 14/14, 운영 전환 검증 4/4가 통과했습니다. 공개용 패치를 공식 Weston 원본에 적용하는 시험과 공개용 바이너리의 빌드·버전 확인은 완료했지만, **완전히 새로운 빈 VM에서 설치 스크립트를 처음부터 끝까지 검증한 것은 아닙니다.**
 
-## 1. 어떤 문제를 해결하나?
+## 1. 어떤 문제를 해결하나요?
 
-Waydroid 자체는 Android를 Linux에서 실행하는 도구야. 그런데 GUI가 없는 원격 Linux 서버의 Android를 Windows RDP로 쓰려면 별도의 Wayland 화면 서버가 필요해.
+Waydroid는 Android를 Linux에서 실행하는 도구입니다. GUI가 없는 원격 Linux 서버의 Android를 Windows RDP로 사용하려면 별도의 Wayland 화면 서버가 필요합니다.
 
-일반 Weston RDP만으로는 Windows의 유니코드/한글 조합 입력을 Android 앱까지 온전히 전달하기 어려웠어. 이번 패키지는 RDP 키 이벤트를 처리하는 Weston 16.0.2를 수정하고, libhangul + 자체 Android 입력기(PickleIME)와 Python 브리지를 더해 이 경로를 연결해. 동시에 사용자 이름과 비밀번호를 쓰는 NLA/NTLM 인증을 설정해.
+일반 Weston RDP만으로는 Windows의 유니코드/한글 조합 입력을 Android 앱까지 온전히 전달하기 어려웠습니다. 이 패키지는 RDP 키 이벤트를 처리하는 Weston 16.0.2를 수정하고, libhangul과 자체 Android 입력기(PickleIME), Python 브리지를 통해 입력 경로를 연결합니다. 또한 사용자 이름과 비밀번호를 사용하는 NLA/NTLM 인증을 설정합니다.
 
 ```text
 Windows 11 (mstsc) 또는 기타 RDP 클라이언트
@@ -31,7 +31,7 @@ PickleIME (Android InputMethodService)
 Waydroid Android 13의 실제 입력창
 ```
 
-여기서 **RDP 서버는 Waydroid가 아니라 Weston**이고, Android는 Weston의 Wayland 화면 위에 출력돼. **한글 전용이 아닌 범용 유니코드 텍스트 전달 기능**이며, 한글 두벌식 조합은 추가 기능이야. `PickleIME`, `com.badung.pickleime`, `pickle-*` 같은 기존 런타임 식별자는 바이너리 호환성을 위해 유지했어. 실제 지원 범위는 RDP 클라이언트, Android 입력창, 문자·메시지 길이에 따라 달라지며 모든 문자와 앱의 종단 간 동작을 보장하지 않아.
+여기서 **RDP 서버는 Waydroid가 아니라 Weston**이며, Android 화면은 Weston의 Wayland 화면 위에 출력됩니다. **한글 전용이 아닌 범용 유니코드 텍스트 전달 기능**이고, 한글 두벌식 조합은 추가 기능입니다. `PickleIME`, `com.badung.pickleime`, `pickle-*` 등의 기존 런타임 식별자는 바이너리 호환성을 위해 유지했습니다. 실제 지원 범위는 RDP 클라이언트, Android 입력창, 문자·메시지 길이에 따라 달라지며, 모든 문자와 앱의 종단 간 동작을 보장하지 않습니다.
 
 ## 2. 설치 전 준비물
 
@@ -44,7 +44,7 @@ Waydroid Android 13의 실제 입력창
 | Windows | 내장 원격 데스크톱 연결 프로그램 `mstsc` |
 | 권장 | RAM 8GB 이상, 그래픽 가속이 없는 경우 CPU 여유 |
 
-**공인 IP의 TCP 3389와 Android ADB 5555를 인터넷에 직접 개방하지 마.** 새 OCI 리전에서는 Tailscale IP를 쓰는 게 편하고 안전해.
+**공인 IP의 TCP 3389와 Android ADB 5555를 인터넷에 직접 개방하지 마세요.** 새 OCI 리전에서는 Tailscale IP를 사용하는 것이 편리하고 안전합니다.
 
 ### 설치에 포함된 파일
 
@@ -65,7 +65,7 @@ Waydroid Android 13의 실제 입력창
 
 ## 3. 새 Ubuntu ARM64 서버 준비
 
-SSH로 서버에 접속한 뒤 아래를 실행해.
+SSH로 서버에 접속한 후 아래 명령을 실행하세요.
 
 ```bash
 uname -m          # aarch64
@@ -74,7 +74,7 @@ uname -r
 modinfo binder_linux
 ```
 
-`aarch64`가 아니거나 지원되지 않는 Ubuntu 버전이면 **사전 빌드 바이너리를 설치하면 안 돼.** `modinfo binder_linux`가 실패하면 해당 커널에서 Binder를 사용할 수 있는지 먼저 해결해야 해. 커널에 따라 모듈 대신 내장 방식일 수도 있으니 Binder 지원 여부를 추가 확인해.
+`aarch64`가 아니거나 지원되지 않는 Ubuntu 버전이라면 **사전 빌드 바이너리를 설치하지 마세요.** `modinfo binder_linux`가 실패하면 해당 커널에서 Binder를 사용할 수 있는지 먼저 확인하고 문제를 해결해야 합니다. 커널에 따라 모듈이 아닌 내장 방식일 수도 있으므로 Binder 지원 여부를 추가로 확인하세요.
 
 기본 패키지:
 
@@ -84,29 +84,29 @@ sudo apt install -y curl ca-certificates git adb python3 openssl \
   weston libhangul1 libfreerdp-server3-3 libwinpr3-3 pipewire pipewire-pulse
 ```
 
-설치 도중 `Unable to locate package`가 나온다면 저장소 구성과 Ubuntu 버전을 확인해. 시스템의 기존 그래픽 세션을 없애거나 다른 Weston 설치를 덮어쓸 필요는 없어.
+설치 도중 `Unable to locate package`가 표시되면 저장소 구성과 Ubuntu 버전을 확인하세요. 시스템의 기존 그래픽 세션을 제거하거나 다른 Weston 설치를 덮어쓸 필요는 없습니다.
 
 ## 4. Waydroid 설치와 Android 초기화 (별도)
 
-Waydroid는 이번 배포물에 포함돼 있지 않아. [Waydroid 공식 설치 안내](https://docs.waydro.id/usage/install-on-desktops)를 기준으로 설치해. Ubuntu의 기본 저장소에서 설치가 가능하면 아래처럼 해.
+Waydroid는 이 배포물에 포함되어 있지 않습니다. [Waydroid 공식 설치 안내](https://docs.waydro.id/usage/install-on-desktops)를 참고하여 설치하세요. Ubuntu의 기본 저장소에서 설치할 수 있다면 아래 명령을 실행하세요.
 
 ```bash
 apt-cache policy waydroid
 sudo apt install -y waydroid
 ```
 
-패키지가 없다면 공식 Waydroid 저장소의 **해당 Ubuntu 버전 지원 여부**를 먼저 확인하고 [공식 설치 안내](https://docs.waydro.id/usage/install-on-desktops)에 따라 저장소를 추가해야 해. 임의의 Ubuntu 코드명을 강제로 지정하지 마.
+패키지가 없다면 공식 Waydroid 저장소의 **해당 Ubuntu 버전 지원 여부**를 먼저 확인하고 [공식 설치 안내](https://docs.waydro.id/usage/install-on-desktops)에 따라 저장소를 추가해야 합니다. 임의의 Ubuntu 코드명을 강제로 지정하지 마세요.
 
-최초 한 번 Android 이미지를 초기화해.
+처음 설치할 때 Android 이미지를 한 번 초기화하세요.
 
 ```bash
 sudo waydroid init            # Google 앱 없는 VANILLA 이미지
 # 또는 (선택 사항): sudo waydroid init -s GAPPS
 ```
 
-위 과정은 Android 시스템/벤더 이미지를 **Waydroid 공급처에서 다운로드**하는 단계야. 다운로드한 이미지는 이 GitHub 저장소에 올라가지 않아.
+위 과정은 Android 시스템/벤더 이미지를 **Waydroid 공급처에서 다운로드**하는 단계입니다. 다운로드한 이미지는 이 GitHub 저장소에 포함되지 않습니다.
 
-**GPU 없는 OCI 인스턴스:** Android 화면이 검게 나오거나 세션이 실행되지 않으면 `/var/lib/waydroid/waydroid.cfg`의 `[properties]` 아래 소프트웨어 렌더링 속성을 지정해야 할 수 있어.
+**GPU가 없는 OCI 인스턴스:** Android 화면이 검게 표시되거나 세션이 실행되지 않으면 `/var/lib/waydroid/waydroid.cfg`의 `[properties]` 아래에 소프트웨어 렌더링 속성을 지정해야 할 수 있습니다.
 
 ```ini
 [properties]
@@ -114,24 +114,24 @@ ro.hardware.gralloc = default
 ro.hardware.egl = swiftshader
 ```
 
-이미 정상 동작하는 서버에서는 변경하지 마. GPU가 없으면 CPU 렌더링이므로 부드러움은 CPU 성능에 따라 달라져.
+이미 정상 동작하는 서버에서는 설정을 변경하지 마세요. GPU가 없으면 CPU 렌더링을 사용하므로 화면의 부드러움은 CPU 성능에 따라 달라집니다.
 
 ## 5. Tailscale 또는 사설망 준비
 
-새 서버에서 Tailscale을 사용한다면 [Tailscale 공식 설치 가이드](https://tailscale.com/kb/1031/install-linux)를 참고해 설치·인증하고, 아래 명령으로 IP를 확인해.
+새 서버에서 Tailscale을 사용한다면 [Tailscale 공식 설치 가이드](https://tailscale.com/kb/1031/install-linux)를 참고하여 설치하고 인증한 후, 아래 명령으로 IP를 확인하세요.
 
 ```bash
 tailscale ip -4
 ip -br addr
 ```
 
-이후 예제에서 `YOUR_PRIVATE_IP`를 **실제 서버에 할당된 사설 IP 또는 Tailscale IP**로 바꾸면 돼. 공인 IP를 지정하지 마.
+이후 예제에서 `YOUR_PRIVATE_IP`를 **실제 서버에 할당된 사설 IP 또는 Tailscale IP**로 변경하세요. 공인 IP를 지정하지 마세요.
 
-OCI 보안 목록/NSG와 서버 방화벽에도 공용 3389 허용 규칙을 만들지 말고, Tailnet 내부 접근만 허용해.
+OCI 보안 목록/NSG와 서버 방화벽에 공용 3389 허용 규칙을 만들지 말고, Tailnet 내부 접근만 허용하세요.
 
 ## 6. 공개 파일 다운로드 및 검증
 
-GitHub에서 이 프로젝트를 clone하거나 ZIP으로 받아 압축 해제한 뒤 프로젝트 폴더에 들어가.
+GitHub에서 이 프로젝트를 복제(clone)하거나 ZIP으로 다운로드하여 압축을 해제한 후 프로젝트 폴더로 이동하세요.
 
 ```bash
 git clone https://github.com/badung2/waydroid-unicode-input.git
@@ -139,27 +139,27 @@ cd waydroid-unicode-input
 bash scripts/install.sh --check
 ```
 
-`CHECK_OK`가 나오면 CPU/운영체제/파일 해시 검사를 통과한 거야. 이 단계는 서비스를 설치하지 않아.
+`CHECK_OK`가 출력되면 CPU/운영체제/파일 해시 검사를 통과한 것입니다. 이 단계에서는 서비스를 설치하지 않습니다.
 
-검증 명령을 따로 실행해도 돼.
+검증 명령을 별도로 실행할 수도 있습니다.
 
 ```bash
 sha256sum -c CHECKSUMS.sha256
 ```
 
-**빌드 과정은 필요 없어.** `dist/weston-arm64.tar.xz`와 `dist/pickle-ime.apk`가 이미 들어 있어.
+**빌드 과정은 필요하지 않습니다.** `dist/weston-arm64.tar.xz`와 `dist/pickle-ime.apk`가 이미 포함되어 있습니다.
 
 ## 7. 설치 실행
 
-이 명령은 **Waydroid를 사용하는 일반 Linux 사용자 계정에서 sudo로** 실행해. `root` 셸만 사용하는 방식은 권장하지 않아.
+이 명령은 **Waydroid를 사용하는 일반 Linux 사용자 계정에서 sudo로** 실행하세요. `root` 셸만 사용하는 방식은 권장하지 않습니다.
 
 ```bash
 sudo bash scripts/install.sh --bind YOUR_PRIVATE_IP --user pickle --port 3389
 ```
 
-서버의 Waydroid IP가 기본값 `192.168.240.112`와 다르면 `waydroid status`에서 주소를 확인하고 `--android-ip 실제_IP`를 추가해.
+서버의 Waydroid IP가 기본값 `192.168.240.112`와 다르면 `waydroid status`에서 주소를 확인하고 `--android-ip 실제_IP` 옵션을 추가하세요.
 
-설치 스크립트는 새 서버에 다음을 구성해.
+설치 스크립트는 새 서버에 다음 항목을 구성합니다.
 
 1. CPU·Ubuntu 버전과 패키지 체크섬 검증
 2. 패치된 Weston 바이너리를 `/opt/pickle-waydroid-rdp/weston`에 설치
@@ -168,7 +168,7 @@ sudo bash scripts/install.sh --bind YOUR_PRIVATE_IP --user pickle --port 3389
 5. 화면 서버, Android UI, 한글 브리지의 사용자 systemd 서비스 등록 및 자동 시작
 6. Android 부팅을 확인한 다음 PickleIME APK 설치·활성화
 
-기존 OCI 서버의 계정·TLS 키를 복사하는 과정은 없어.
+기존 OCI 서버의 계정이나 TLS 키를 복사하는 과정은 없습니다.
 
 ### 최초 로그인 정보
 
@@ -176,7 +176,7 @@ sudo bash scripts/install.sh --bind YOUR_PRIVATE_IP --user pickle --port 3389
 sudo cat /etc/pickle-waydroid-rdp/first-login.txt
 ```
 
-**이 파일은 현재 서버에서 새로 발급한 비밀번호를 담으므로 타인에게 공유하거나 GitHub에 올리면 안 돼.** 안전한 비밀번호 관리 도구에 옮긴 후 삭제해도 돼. 다른 서버에 같은 설정을 설치하면 비밀번호·인증서는 별도로 생성돼.
+**이 파일에는 현재 서버에서 새로 발급한 비밀번호가 포함되어 있으므로 타인에게 공유하거나 GitHub에 업로드하지 마세요.** 안전한 비밀번호 관리 도구에 저장한 후 해당 파일을 삭제해도 됩니다. 다른 서버에 같은 설정을 설치하면 비밀번호와 인증서가 별도로 생성됩니다.
 
 ## 8. Windows 11에서 접속
 
@@ -186,13 +186,13 @@ sudo cat /etc/pickle-waydroid-rdp/first-login.txt
 4. 비밀번호: `first-login.txt`에 저장된 새 비밀번호
 5. 처음 연결할 때 자체 서명 인증서 안내가 나오면 **연결하려는 서버의 인증서 지문을 직접 확인**한 다음 진행
 
-`/etc/pickle-waydroid-rdp/tls.crt`에서 지문을 확인할 수 있어.
+`/etc/pickle-waydroid-rdp/tls.crt`에서 인증서 지문을 확인할 수 있습니다.
 
 ```bash
 openssl x509 -in /etc/pickle-waydroid-rdp/tls.crt -noout -fingerprint -sha256
 ```
 
-Windows의 `자격 증명 기억` 여부는 **Windows 클라이언트 정책**에 달려 있으며, 이 서버 설치 스크립트가 강제하지 않아.
+Windows의 `자격 증명 기억` 여부는 **Windows 클라이언트 정책**에 따라 결정되며, 이 서버 설치 스크립트가 강제하지 않습니다.
 
 ## 9. 한글/영문 입력 방법
 
@@ -205,7 +205,7 @@ Windows의 `자격 증명 기억` 여부는 **Windows 클라이언트 정책**�
 | 유니코드 입력 | RDP 클라이언트가 UnicodeKeyboardEvent를 전달하면 직접 전달 |
 | Backspace/방향키/Enter | Android IME 입력 이벤트로 처리 |
 
-입력창에 `안녕하세요 반갑습니다.`, `Hello 2026!`, 특수기호, 여러 줄 입력을 시도해 봐. **클라이언트·Android 앱에 따라 입력 이벤트 동작이 다를 수 있어.**
+입력창에서 `안녕하세요 반갑습니다.`, `Hello 2026!`, 특수기호, 여러 줄 입력을 시도해 보세요. **클라이언트와 Android 앱에 따라 입력 이벤트의 동작이 다를 수 있습니다.**
 
 ## 10. 설치 후 점검
 
@@ -229,18 +229,18 @@ systemctl status waydroid-container.service
 adb devices
 ```
 
-`RDP_ANDROID_IME_READY`가 보이면 브리지 시작 준비를 통과한 거야. 실제 앱 입력까지 성공했다는 뜻은 아니니 직접 타이핑 시험도 해.
+`RDP_ANDROID_IME_READY`가 표시되면 브리지의 시작 준비가 완료된 것입니다. 실제 앱 입력까지 성공했다는 의미는 아니므로 직접 입력 테스트도 진행하세요.
 
 ## 11. 재부팅·자동 복구
 
-설치 시 `systemctl --user enable`과 `loginctl enable-linger`로 서비스 자동 시작을 구성해. Linux 시스템 부팅 시 Waydroid Binderfs를 먼저 준비하도록 설정해.
+설치 시 `systemctl --user enable`과 `loginctl enable-linger`로 서비스 자동 시작을 구성합니다. Linux 시스템이 부팅될 때 Waydroid Binderfs를 먼저 준비하도록 설정합니다.
 
 ```bash
 loginctl show-user "$USER" -p Linger
 systemctl --user is-enabled pickle-rdp-live.service pickle-waydroid-live.service pickle-rdp-android-input.service
 ```
 
-재부팅 자체가 안전한 환경인지 확인한 후에만 재시작 테스트를 진행해. 새 서버에서는 부팅 뒤 `bash scripts/verify.sh`를 재실행해. 입력 브리지는 ADB 연결이 끊기면 재접속을 시도하도록 구현했어.
+재부팅해도 안전한 환경인지 확인한 후에만 재시작 테스트를 진행하세요. 새 서버에서는 부팅 후 `bash scripts/verify.sh`를 다시 실행하세요. 입력 브리지는 ADB 연결이 끊기면 재접속을 시도하도록 구현했습니다.
 
 ## 12. 주요 오류 해결
 
@@ -256,11 +256,11 @@ systemctl --user is-enabled pickle-rdp-live.service pickle-waydroid-live.service
 | Android IP가 달라짐 | `waydroid status`에서 실제 IP 확인, 설치 옵션 `--android-ip` 일치 여부 |
 | Windows 저장 비번이 사라짐 | Windows `cmdkey /list`와 자격 증명 저장 정책 점검 |
 
-문제를 해결하기 전에 운영중인 다른 Docker/서비스를 함부로 중지하지 마.
+문제를 해결하기 전에 운영 중인 다른 Docker 컨테이너나 서비스를 임의로 중지하지 마세요.
 
 ## 13. 직접 소스 빌드(선택 사항)
 
-이미 빌드된 바이너리를 쓰면 이 단계는 건너뛰어도 돼. 패치 원본 검증·다른 아키텍처 빌드가 필요하면 공식 Weston 16.0.2 소스를 내려받아.
+이미 빌드된 바이너리를 사용하는 경우 이 단계는 건너뛰셔도 됩니다. 패치 원본 검증이나 다른 아키텍처용 빌드가 필요하면 공식 Weston 16.0.2 소스를 다운로드하세요.
 
 ```bash
 curl -L -O https://gitlab.freedesktop.org/wayland/weston/-/releases/16.0.2/downloads/weston-16.0.2.tar.xz
@@ -269,10 +269,10 @@ tar xf weston-16.0.2.tar.xz
 patch -d weston-16.0.2 -p2 < source/weston-16.0.2-pickle.patch
 ```
 
-IME 원본은 `source/android-ime/app/`, 브리지 코드는 `runtime/android_input.py`에 있어. **APK 서명용 개인키는 배포하지 않으므로** 직접 재빌드한 APK에 서명하려면 새로운 키가 필요해.
+IME 원본은 `source/android-ime/app/`, 브리지 코드는 `runtime/android_input.py`에 있습니다. **APK 서명용 개인키는 배포하지 않으므로** 직접 재빌드한 APK에 서명하려면 새로운 키가 필요합니다.
 
 ## 14. 프로젝트 출처·제약
 
-이건 Weston/Waydroid의 공식 릴리스가 아니라, **Weston 16.0.2를 기반으로 수정한 커뮤니티 배포본**이야. Weston의 기존 저작권 고지를 유지하고, libhangul은 LGPL-2.1+ 등 별도 라이선스를 사용해. [NOTICE.md](NOTICE.md)와 [licenses/](licenses/)를 꼭 읽어 줘.
+이 프로젝트는 Weston/Waydroid의 공식 릴리스가 아니라, **Weston 16.0.2를 기반으로 수정한 커뮤니티 배포본**입니다. Weston의 기존 저작권 고지를 유지하며, libhangul은 LGPL-2.1+ 등 별도 라이선스를 사용합니다. [NOTICE.md](NOTICE.md)와 [licenses/](licenses/)를 반드시 확인해 주세요.
 
-다른 배포판·RDP 클라이언트·Android 앱에서 같은 동작이 자동 보장되는 건 아니야. 특히 새 VM 완전 설치·재부팅 테스트는 후속 검증 항목이야.
+다른 배포판·RDP 클라이언트·Android 앱에서 동일한 동작이 자동으로 보장되는 것은 아닙니다. 특히 새 VM에서의 완전 설치 및 재부팅 테스트는 후속 검증 항목입니다.
