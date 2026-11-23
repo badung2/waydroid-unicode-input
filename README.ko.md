@@ -2,7 +2,9 @@
 
 **Waydroid의 Android 화면에 Windows 원격 데스크톱(RDP)으로 접속하고, 한글·유니코드 입력과 아이디/비밀번호(NLA) 로그인을 사용할 수 있게 하는 오픈소스 패치 패키지.**
 
-[English README](README.md) · [라이선스/출처](NOTICE.md) · [보안](SECURITY.md) · [고급 문제 해결](docs/TROUBLESHOOTING.ko.md)
+[![한국어](https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-0969da?style=for-the-badge)](README.ko.md) [![English](https://img.shields.io/badge/English-0969da?style=for-the-badge)](README.md)
+
+[라이선스/출처](NOTICE.md) · [보안](SECURITY.md) · [고급 문제 해결](docs/TROUBLESHOOTING.ko.md)
 
 > **배포 범위:** Weston 패치 소스, 한글 입력 브리지, PickleIME Android 앱 소스·APK, 검증된 ARM64용 Weston 빌드, 설정·검증 스크립트. **Waydroid 프로그램·Android 운영체제 이미지·Google 앱은 포함하지 않습니다.**
 >
