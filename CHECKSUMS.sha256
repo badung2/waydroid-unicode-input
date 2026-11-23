@@ -1,0 +1,4 @@
+a9ed192d57b0403ad4ef4d24edfb3b172df0024b03181087cf6d82cac9604d44  dist/weston-arm64.tar.xz
+9314f080eb13ecaad974ab7b794232cb9dcf3e5a58cf197aba249da51b61e159  dist/pickle-ime.apk
+bda88295c6d1bfb69de9be474523a10ccd4df013404cbd27cf3df2b7723665d8  source/weston-16.0.2-pickle.patch
+9dc5d4a5f3f18e776f3eba228bba270e067058f5afe6a6250a862dc4436ce5b0  runtime/android_input.py

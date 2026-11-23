@@ -1,0 +1,3633 @@
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/clients/meson.build pickle-rdp-live/weston-16.0.2/clients/meson.build
+--- _release-upstream/weston-16.0.2/clients/meson.build	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/clients/meson.build	2026-11-22 05:48:04.158990598 +0000
+@@ -1,3 +1,11 @@
++executable('weston-text-input-test',
++	'text-input-test.c',
++	xdg_shell_client_protocol_h, xdg_shell_protocol_c,
++	text_input_unstable_v3_client_protocol_h, text_input_unstable_v3_protocol_c,
++	include_directories: common_inc,
++	dependencies: [dep_wayland_client, dep_libshared],
++	install: true)
++
+ if get_option('resize-pool')
+ 	config_h.set('USE_RESIZE_POOL', '1')
+ endif
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/clients/text-input-test.c pickle-rdp-live/weston-16.0.2/clients/text-input-test.c
+--- _release-upstream/weston-16.0.2/clients/text-input-test.c	1970-01-01 00:00:00.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/clients/text-input-test.c	2026-11-22 05:49:18.636929228 +0000
+@@ -0,0 +1,434 @@
++#include "config.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++#include <wayland-client.h>
++#include "shared/os-compatibility.h"
++#include "xdg-shell-client-protocol.h"
++#include "text-input-unstable-v3-client-protocol.h"
++
++struct display {
++	struct wl_display *display;
++	struct wl_registry *registry;
++	struct wl_compositor *compositor;
++	struct wl_seat *seat;
++	struct wl_shm *shm;
++	struct xdg_wm_base *xdg_wm_base;
++	struct zwp_text_input_manager_v3 *text_input_manager;
++	bool text_input_manager_seen;
++};
++
++struct buffer {
++	struct wl_buffer *buffer;
++	void *shm_data;
++	size_t size;
++};
++
++struct keyboard {
++	struct wl_keyboard *keyboard;
++	bool pressed[256];
++};
++
++struct test {
++	struct display display;
++	struct wl_surface *surface;
++	struct xdg_surface *xdg_surface;
++	struct xdg_toplevel *xdg_toplevel;
++	struct zwp_text_input_v3 *text_input;
++	struct keyboard keyboard;
++	struct buffer buffer;
++	int32_t width, height;
++	bool configured;
++	bool text_input_enabled;
++	bool running;
++	int exit_code;
++};
++
++static void
++buffer_release(void *data, struct wl_buffer *buffer)
++{
++}
++
++static const struct wl_buffer_listener buffer_listener = {
++	buffer_release
++};
++
++static int
++create_shm_buffer(struct test *test, int32_t width, int32_t height)
++{
++	struct display *display = &test->display;
++	struct wl_shm_pool *pool;
++	int fd, stride;
++	void *data;
++
++	stride = width * 4;
++	fd = os_create_anonymous_file(height * stride);
++	if (fd < 0) {
++		fprintf(stderr, "creating a buffer file failed: %s\n",
++			strerror(errno));
++		return -1;
++	}
++
++	data = mmap(NULL, height * stride, PROT_READ | PROT_WRITE,
++		    MAP_SHARED, fd, 0);
++	if (data == MAP_FAILED) {
++		fprintf(stderr, "mmap failed: %s\n", strerror(errno));
++		close(fd);
++		return -1;
++	}
++
++	pool = wl_shm_create_pool(display->shm, fd, height * stride);
++	test->buffer.buffer =
++		wl_shm_pool_create_buffer(pool, 0, width, height, stride,
++					  WL_SHM_FORMAT_ARGB8888);
++	wl_buffer_add_listener(test->buffer.buffer, &buffer_listener,
++			       test);
++	wl_shm_pool_destroy(pool);
++
++	for (int32_t y = 0; y < height; y++) {
++		uint32_t *row = (uint32_t *)((char *)data + y * stride);
++		for (int32_t x = 0; x < width; x++)
++			row[x] = 0xFF205080;
++	}
++
++	munmap(data, height * stride);
++	close(fd);
++
++	test->buffer.size = (size_t)height * stride;
++	test->width = width;
++	test->height = height;
++
++	return 0;
++}
++
++static void
++redraw(struct test *test)
++{
++	if (!test->buffer.buffer &&
++	    create_shm_buffer(test, 480, 240) < 0) {
++		test->exit_code = EXIT_FAILURE;
++		return;
++	}
++
++	wl_surface_attach(test->surface, test->buffer.buffer, 0, 0);
++	wl_surface_damage(test->surface, 0, 0, test->width, test->height);
++	wl_surface_commit(test->surface);
++}
++
++static void
++text_input_enter(void *data, struct zwp_text_input_v3 *text_input,
++		 struct wl_surface *surface)
++{
++	printf("[ti] enter (surface %p) - now enabling text input\n",
++	       (void *)surface);
++}
++
++static void
++text_input_leave(void *data, struct zwp_text_input_v3 *text_input,
++		 struct wl_surface *surface)
++{
++	printf("[ti] leave (surface %p)\n", (void *)surface);
++}
++
++static void
++text_input_preedit_string(void *data, struct zwp_text_input_v3 *text_input,
++			  const char *text, int32_t cursor_begin,
++			  int32_t cursor_end)
++{
++	printf("[ti] PREEDIT \"%s\" (cursor %d..%d)\n", text, cursor_begin,
++	       cursor_end);
++}
++
++static void
++text_input_commit_string(void *data, struct zwp_text_input_v3 *text_input,
++			 const char *text)
++{
++	const unsigned char *p = (const unsigned char *)(text ? text : "");
++
++	printf("[ti] COMMIT \"%s\"\n", text ? text : "");
++	fputs("COMMIT_HEX ", stdout);
++	for (; *p; p++)
++		printf("%02x", *p);
++	putchar('\n');
++}
++
++static void
++text_input_delete_surrounding_text(void *data,
++				   struct zwp_text_input_v3 *text_input,
++				   uint32_t before_length,
++				   uint32_t after_length)
++{
++	printf("[ti] delete_surrounding_text %u %u\n", before_length,
++	       after_length);
++}
++
++static void
++text_input_done(void *data, struct zwp_text_input_v3 *text_input,
++		uint32_t serial)
++{
++	printf("[ti] done (serial %u)\n", serial);
++}
++
++static const struct zwp_text_input_v3_listener text_input_listener = {
++	text_input_enter,
++	text_input_leave,
++	text_input_preedit_string,
++	text_input_commit_string,
++	text_input_delete_surrounding_text,
++	text_input_done,
++};
++
++static void
++keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format,
++		int32_t fd, uint32_t size)
++{
++	close(fd);
++}
++
++static void
++keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
++	       struct wl_surface *surface, struct wl_array *keys)
++{
++	printf("[kbd] enter\n");
++}
++
++static void
++keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
++	       struct wl_surface *surface)
++{
++	printf("[kbd] leave\n");
++}
++
++static void
++keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
++	     uint32_t time, uint32_t key, uint32_t state)
++{
++	struct test *test = data;
++
++	printf("[kbd] key %u %s\n", key,
++	       state == WL_KEYBOARD_KEY_STATE_PRESSED ? "press" :
++	       "release");
++
++	if (state == WL_KEYBOARD_KEY_STATE_PRESSED && key < 256)
++		test->keyboard.pressed[key] = true;
++	else if (state == WL_KEYBOARD_KEY_STATE_RELEASED && key < 256)
++		test->keyboard.pressed[key] = false;
++}
++
++static void
++keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
++		   uint32_t mods_depressed, uint32_t mods_latched,
++		   uint32_t mods_locked, uint32_t group)
++{
++}
++
++static void
++keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
++		     int32_t rate, int32_t delay)
++{
++}
++
++static const struct wl_keyboard_listener keyboard_listener = {
++	keyboard_keymap,
++	keyboard_enter,
++	keyboard_leave,
++	keyboard_key,
++	keyboard_modifiers,
++	keyboard_repeat_info,
++};
++
++static void
++xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
++		      uint32_t serial)
++{
++	struct test *test = data;
++
++	xdg_surface_ack_configure(xdg_surface, serial);
++
++	if (!test->configured) {
++		test->configured = true;
++		redraw(test);
++
++		if (test->text_input && !test->text_input_enabled) {
++			zwp_text_input_v3_enable(test->text_input);
++			zwp_text_input_v3_set_content_type(
++				test->text_input,
++				ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
++				ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
++			zwp_text_input_v3_commit(test->text_input);
++			test->text_input_enabled = true;
++			printf("[ti] enable+commit sent\n");
++		}
++	}
++}
++
++static const struct xdg_surface_listener xdg_surface_listener = {
++	xdg_surface_configure
++};
++
++static void
++xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel,
++		       int32_t width, int32_t height,
++		       struct wl_array *states)
++{
++}
++
++static void
++xdg_toplevel_close(void *data, struct xdg_toplevel *xdg_toplevel)
++{
++	struct test *test = data;
++
++	test->running = false;
++}
++
++static const struct xdg_toplevel_listener xdg_toplevel_listener = {
++	xdg_toplevel_configure,
++	xdg_toplevel_close,
++};
++
++static void
++xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base,
++		 uint32_t serial)
++{
++	xdg_wm_base_pong(xdg_wm_base, serial);
++}
++
++static const struct xdg_wm_base_listener xdg_wm_base_listener = {
++	xdg_wm_base_ping
++};
++
++static void
++seat_handle_capabilities(void *data, struct wl_seat *seat,
++			 enum wl_seat_capability caps)
++{
++	struct test *test = data;
++
++	if (caps & WL_SEAT_CAPABILITY_KEYBOARD &&
++	    !test->keyboard.keyboard) {
++		test->keyboard.keyboard = wl_seat_get_keyboard(seat);
++		wl_keyboard_add_listener(test->keyboard.keyboard,
++					 &keyboard_listener, test);
++	}
++}
++
++static void
++seat_handle_name(void *data, struct wl_seat *seat, const char *name)
++{
++}
++
++static const struct wl_seat_listener seat_listener = {
++	seat_handle_capabilities,
++	seat_handle_name,
++};
++
++static void
++registry_handle_global(void *data, struct wl_registry *registry,
++		       uint32_t name, const char *interface,
++		       uint32_t version)
++{
++	struct test *test = data;
++	struct display *d = &test->display;
++
++	if (strcmp(interface, "wl_compositor") == 0) {
++		d->compositor =
++			wl_registry_bind(registry, name,
++					 &wl_compositor_interface, 1);
++	} else if (strcmp(interface, "wl_seat") == 0) {
++		d->seat = wl_registry_bind(registry, name,
++					   &wl_seat_interface, 1);
++		wl_seat_add_listener(d->seat, &seat_listener, test);
++	} else if (strcmp(interface, "wl_shm") == 0) {
++		d->shm = wl_registry_bind(registry, name,
++					  &wl_shm_interface, 1);
++	} else if (strcmp(interface, "xdg_wm_base") == 0) {
++		d->xdg_wm_base = wl_registry_bind(registry, name,
++						  &xdg_wm_base_interface, 1);
++		xdg_wm_base_add_listener(d->xdg_wm_base,
++					 &xdg_wm_base_listener, test);
++	} else if (strcmp(interface, "zwp_text_input_manager_v3") == 0) {
++		d->text_input_manager_seen = true;
++		d->text_input_manager =
++			wl_registry_bind(registry, name,
++					 &zwp_text_input_manager_v3_interface,
++					 1);
++	}
++}
++
++static void
++registry_handle_global_remove(void *data, struct wl_registry *registry,
++			      uint32_t name)
++{
++}
++
++static const struct wl_registry_listener registry_listener = {
++	registry_handle_global,
++	registry_handle_global_remove
++};
++
++int
++main(int argc, char *argv[])
++{
++	struct test test = { 0 };
++	struct display *d = &test.display;
++
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	test.width = 480;
++	test.height = 240;
++
++	d->display = wl_display_connect(NULL);
++	if (!d->display) {
++		fprintf(stderr, "failed to connect to a wayland compositor\n");
++		return EXIT_FAILURE;
++	}
++
++	d->registry = wl_display_get_registry(d->display);
++	wl_registry_add_listener(d->registry, &registry_listener, &test);
++	wl_display_roundtrip(d->display);
++
++	if (!d->compositor || !d->shm || !d->xdg_wm_base || !d->seat) {
++		fprintf(stderr, "required globals missing\n");
++		return EXIT_FAILURE;
++	}
++
++	if (!d->text_input_manager) {
++		fprintf(stderr, "zwp_text_input_manager_v3 not advertised by "
++			"the compositor - text-input-bridge is not active\n");
++		return EXIT_FAILURE;
++	}
++
++	test.surface = wl_compositor_create_surface(d->compositor);
++
++	test.xdg_surface = xdg_wm_base_get_xdg_surface(d->xdg_wm_base,
++						       test.surface);
++	xdg_surface_add_listener(test.xdg_surface, &xdg_surface_listener,
++				 &test);
++
++	test.xdg_toplevel = xdg_surface_get_toplevel(test.xdg_surface);
++	xdg_toplevel_add_listener(test.xdg_toplevel, &xdg_toplevel_listener,
++				  &test);
++	xdg_toplevel_set_title(test.xdg_toplevel, "text-input-test");
++
++	test.text_input =
++		zwp_text_input_manager_v3_get_text_input(
++			d->text_input_manager, d->seat);
++	zwp_text_input_v3_add_listener(test.text_input,
++				       &text_input_listener, &test);
++
++	wl_surface_commit(test.surface);
++
++	test.running = true;
++	while (test.running && wl_display_dispatch(d->display) >= 0)
++		;
++
++	fprintf(stderr, "exiting (code %d)\n", test.exit_code);
++	return test.exit_code;
++}
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/frontend/main.c pickle-rdp-live/weston-16.0.2/frontend/main.c
+--- _release-upstream/weston-16.0.2/frontend/main.c	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/frontend/main.c	2026-11-22 05:47:36.532663853 +0000
+@@ -60,6 +60,7 @@
+ #include <libweston/version.h>
+ #include "weston.h"
+ #include "weston-private.h"
++#include <libweston/text-input-bridge.h>
+ 
+ #include <libweston/backend-drm.h>
+ #include <libweston/backend-headless.h>
+@@ -5528,6 +5529,9 @@
+ 	if (wet_load_shell(wet.compositor, shell, &argc, argv) < 0)
+ 		goto out;
+ 
++	if (text_input_bridge_init(wet.compositor) < 0)
++		goto out;
++
+ 	/* Load xwayland before other modules - this way if we're using
+ 	 * the systemd-notify module it will notify after we're ready
+ 	 * to receive xwayland connections.
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/frontend/meson.build pickle-rdp-live/weston-16.0.2/frontend/meson.build
+--- _release-upstream/weston-16.0.2/frontend/meson.build	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/frontend/meson.build	2026-11-22 05:47:13.765954088 +0000
+@@ -2,6 +2,9 @@
+ 	git_version_h,
+ 	'main.c',
+ 	'text-backend.c',
++	'text-input-bridge.c',
++	text_input_unstable_v3_server_protocol_h,
++	text_input_unstable_v3_protocol_c,
+ 	'config-helpers.c',
+ 	'weston-screenshooter.c',
+ 	text_input_unstable_v1_server_protocol_h,
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/frontend/text-backend.c pickle-rdp-live/weston-16.0.2/frontend/text-backend.c
+--- _release-upstream/weston-16.0.2/frontend/text-backend.c	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/frontend/text-backend.c	2026-11-22 05:52:14.955825267 +0000
+@@ -876,12 +876,20 @@
+ 		  uint32_t id)
+ {
+ 	struct input_method *input_method = data;
+-	struct text_backend *text_backend = input_method->text_backend;
++	struct text_backend *text_backend = input_method ? input_method->text_backend : NULL;
+ 	struct wl_resource *resource;
+ 
+ 	resource =
+ 		wl_resource_create(client,
+ 				   &zwp_input_method_v1_interface, 1, id);
++	if (!resource) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++	if (!input_method) {
++		wl_resource_set_implementation(resource, NULL, NULL, NULL);
++		return;
++	}
+ 
+ 	if (input_method->input_method_binding != NULL) {
+ 		wl_resource_post_error(resource,
+@@ -915,7 +923,8 @@
+ 	if (input_method->input_method_binding)
+ 		wl_resource_set_user_data(input_method->input_method_binding, NULL);
+ 
+-	wl_global_destroy(input_method->input_method_global);
++	weston_global_destroy_safe(input_method->seat->compositor,
++				   input_method->input_method_global);
+ 	wl_list_remove(&input_method->destroy_listener.link);
+ 	input_method->seat->input_method = NULL;
+ 
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/frontend/text-input-bridge.c pickle-rdp-live/weston-16.0.2/frontend/text-input-bridge.c
+--- _release-upstream/weston-16.0.2/frontend/text-input-bridge.c	1970-01-01 00:00:00.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/frontend/text-input-bridge.c	2026-11-22 05:49:27.588515955 +0000
+@@ -0,0 +1,611 @@
++#include "config.h"
++
++#include <stdlib.h>
++#include <string.h>
++#include <inttypes.h>
++
++#include <libweston/libweston.h>
++#include <libweston/plugin-registry.h>
++#include <libweston/text-input-bridge.h>
++
++#include "weston.h"
++#include "text-input-unstable-v3-server-protocol.h"
++#include "shared/helpers.h"
++#include "shared/xalloc.h"
++
++struct ti_bridge {
++	struct weston_compositor *ec;
++	struct wl_global *manager_global;
++	struct wl_listener destroy_listener;
++
++	struct wl_list text_inputs;
++
++	void (*state_cb)(bool active, struct weston_surface *surface,
++			 void *user_data);
++	void *state_cb_user_data;
++};
++
++struct bridge_text_input {
++	struct wl_resource *resource;
++	struct ti_bridge *bridge;
++
++	struct weston_seat *seat;
++	struct weston_surface *surface;
++
++	bool enabled;
++	int32_t cursor_x, cursor_y, cursor_w, cursor_h;
++	bool have_cursor_rect;
++	uint32_t content_hint;
++	uint32_t content_purpose;
++
++	bool pending_enabled;
++	bool have_pending_cursor_rect;
++	int32_t pending_cursor_x, pending_cursor_y;
++	int32_t pending_cursor_w, pending_cursor_h;
++
++	uint32_t done_serial;
++
++	bool entered;
++
++	struct weston_keyboard *keyboard_listener_attached_to;
++	struct wl_listener keyboard_focus_listener;
++	bool seat_listener_attached;
++	struct wl_listener seat_destroy_listener;
++
++	struct weston_surface *surface_listener_attached_to;
++	struct wl_listener surface_destroy_listener;
++
++	struct wl_list link;
++};
++
++static struct ti_bridge *g_bridge;
++
++static void bridge_notify_state(struct ti_bridge *bridge);
++static void ti_update_focus(struct bridge_text_input *ti);
++static void ti_keyboard_focus_handler(struct wl_listener *listener,
++				      void *data);
++static void ti_seat_destroy_handler(struct wl_listener *listener,
++				    void *data);
++
++static struct bridge_text_input *
++ti_from_resource(struct wl_resource *resource)
++{
++	return wl_resource_get_user_data(resource);
++}
++
++static void
++bridge_send_done(struct bridge_text_input *ti)
++{
++	zwp_text_input_v3_send_done(ti->resource, ti->done_serial);
++}
++
++static void
++bridge_send_enter(struct bridge_text_input *ti)
++{
++	if (ti->entered || !ti->surface)
++		return;
++
++	zwp_text_input_v3_send_enter(ti->resource, ti->surface->resource);
++	ti->entered = true;
++}
++
++static void
++bridge_send_leave(struct bridge_text_input *ti)
++{
++	if (!ti->entered)
++		return;
++
++	if (ti->surface && ti->surface->resource)
++		zwp_text_input_v3_send_leave(ti->resource,
++					     ti->surface->resource);
++	ti->entered = false;
++}
++
++static struct weston_keyboard *
++ti_get_keyboard(struct bridge_text_input *ti)
++{
++	return ti->seat ? weston_seat_get_keyboard(ti->seat) : NULL;
++}
++
++static void
++ti_attach_keyboard_listener(struct bridge_text_input *ti)
++{
++	struct weston_keyboard *keyboard = ti_get_keyboard(ti);
++
++	if (ti->keyboard_listener_attached_to || !keyboard)
++		return;
++
++	ti->keyboard_focus_listener.notify = ti_keyboard_focus_handler;
++	wl_signal_add(&keyboard->focus_signal,
++		      &ti->keyboard_focus_listener);
++	if (!ti->seat_listener_attached) {
++		ti->seat_destroy_listener.notify = ti_seat_destroy_handler;
++		wl_signal_add(&ti->seat->destroy_signal,
++			      &ti->seat_destroy_listener);
++		ti->seat_listener_attached = true;
++	}
++	ti->keyboard_listener_attached_to = keyboard;
++}
++
++static void
++ti_seat_destroy_handler(struct wl_listener *listener, void *data)
++{
++	struct bridge_text_input *ti =
++		container_of(listener, struct bridge_text_input,
++			     seat_destroy_listener);
++
++	/* Weston destroys the keyboard before emitting the seat signal. */
++	ti->keyboard_listener_attached_to = NULL;
++	ti->seat_listener_attached = false;
++	ti->seat = NULL;
++	ti->enabled = false;
++	bridge_notify_state(ti->bridge);
++}
++
++static void
++ti_surface_destroy_handler(struct wl_listener *listener, void *data)
++{
++	struct bridge_text_input *ti =
++		container_of(listener, struct bridge_text_input,
++			     surface_destroy_listener);
++
++	ti->surface_listener_attached_to = NULL;
++	ti->entered = false;
++	ti->surface = NULL;
++	bridge_notify_state(ti->bridge);
++}
++
++static void
++ti_keyboard_focus_handler(struct wl_listener *listener, void *data)
++{
++	struct bridge_text_input *ti =
++		container_of(listener, struct bridge_text_input,
++			     keyboard_focus_listener);
++
++	ti_update_focus(ti);
++	bridge_notify_state(ti->bridge);
++}
++
++static void
++ti_set_surface(struct bridge_text_input *ti, struct weston_surface *surface)
++{
++	if (ti->surface == surface)
++		return;
++
++	if (ti->surface_listener_attached_to) {
++		wl_list_remove(&ti->surface_destroy_listener.link);
++		ti->surface_listener_attached_to = NULL;
++	}
++
++	bridge_send_leave(ti);
++
++	ti->surface = surface;
++	ti->entered = false;
++
++	if (ti->surface) {
++		ti->surface_destroy_listener.notify =
++			ti_surface_destroy_handler;
++		wl_signal_add(&ti->surface->destroy_signal,
++			      &ti->surface_destroy_listener);
++		ti->surface_listener_attached_to = ti->surface;
++	}
++}
++
++static void
++ti_update_focus(struct bridge_text_input *ti)
++{
++	struct weston_keyboard *keyboard = ti_get_keyboard(ti);
++	struct weston_surface *focus = keyboard ? keyboard->focus : NULL;
++
++	ti_attach_keyboard_listener(ti);
++
++	if (focus &&
++	    (!focus->resource ||
++	     wl_resource_get_client(focus->resource) !=
++	     wl_resource_get_client(ti->resource)))
++		focus = NULL;
++
++	if (ti->surface != focus)
++		ti_set_surface(ti, focus);
++
++	if (focus)
++		bridge_send_enter(ti);
++}
++
++static void
++bridge_notify_state(struct ti_bridge *bridge)
++{
++	struct bridge_text_input *ti, *active = NULL;
++	struct weston_surface *surface = NULL;
++
++	wl_list_for_each(ti, &bridge->text_inputs, link) {
++		struct weston_keyboard *keyboard = ti_get_keyboard(ti);
++
++		if (!ti->enabled || !ti->surface)
++			continue;
++
++		if (keyboard && keyboard->focus == ti->surface) {
++			active = ti;
++			surface = ti->surface;
++			break;
++		}
++	}
++
++	if (bridge->state_cb)
++		bridge->state_cb(active != NULL, surface,
++				 bridge->state_cb_user_data);
++}
++
++static void
++ti_request_destroy(struct wl_client *client, struct wl_resource *resource)
++{
++	wl_resource_destroy(resource);
++}
++
++static void
++ti_request_enable(struct wl_client *client, struct wl_resource *resource)
++{
++	struct bridge_text_input *ti = ti_from_resource(resource);
++
++	ti->pending_enabled = true;
++}
++
++static void
++ti_request_disable(struct wl_client *client, struct wl_resource *resource)
++{
++	struct bridge_text_input *ti = ti_from_resource(resource);
++
++	ti->pending_enabled = false;
++}
++
++static void
++ti_request_set_surrounding_text(struct wl_client *client,
++				struct wl_resource *resource,
++				const char *text, int32_t cursor,
++				int32_t anchor)
++{
++}
++
++static void
++ti_request_set_text_change_cause(struct wl_client *client,
++				 struct wl_resource *resource,
++				 uint32_t cause)
++{
++}
++
++static void
++ti_request_set_content_type(struct wl_client *client,
++			    struct wl_resource *resource,
++			    uint32_t hint, uint32_t purpose)
++{
++	struct bridge_text_input *ti = ti_from_resource(resource);
++
++	ti->content_hint = hint;
++	ti->content_purpose = purpose;
++}
++
++static void
++ti_request_set_cursor_rectangle(struct wl_client *client,
++				struct wl_resource *resource,
++				int32_t x, int32_t y,
++				int32_t width, int32_t height)
++{
++	struct bridge_text_input *ti = ti_from_resource(resource);
++
++	ti->pending_cursor_x = x;
++	ti->pending_cursor_y = y;
++	ti->pending_cursor_w = width;
++	ti->pending_cursor_h = height;
++	ti->have_pending_cursor_rect = true;
++}
++
++static void
++ti_request_commit(struct wl_client *client, struct wl_resource *resource)
++{
++	struct bridge_text_input *ti = ti_from_resource(resource);
++
++	++ti->done_serial;
++	ti->enabled = ti->pending_enabled;
++
++	if (ti->have_pending_cursor_rect) {
++		ti->cursor_x = ti->pending_cursor_x;
++		ti->cursor_y = ti->pending_cursor_y;
++		ti->cursor_w = ti->pending_cursor_w;
++		ti->cursor_h = ti->pending_cursor_h;
++		ti->have_cursor_rect = true;
++		ti->have_pending_cursor_rect = false;
++	}
++
++	ti_update_focus(ti);
++
++	bridge_notify_state(ti->bridge);
++}
++
++static const struct zwp_text_input_v3_interface ti_implementation = {
++	.destroy = ti_request_destroy,
++	.enable = ti_request_enable,
++	.disable = ti_request_disable,
++	.set_surrounding_text = ti_request_set_surrounding_text,
++	.set_text_change_cause = ti_request_set_text_change_cause,
++	.set_content_type = ti_request_set_content_type,
++	.set_cursor_rectangle = ti_request_set_cursor_rectangle,
++	.commit = ti_request_commit,
++};
++
++static void
++ti_unbind(struct wl_resource *resource)
++{
++	struct bridge_text_input *ti = ti_from_resource(resource);
++
++	bridge_send_leave(ti);
++
++	if (ti->keyboard_listener_attached_to &&
++	    ti->keyboard_listener_attached_to == ti_get_keyboard(ti))
++		wl_list_remove(&ti->keyboard_focus_listener.link);
++
++	if (ti->seat_listener_attached)
++		wl_list_remove(&ti->seat_destroy_listener.link);
++
++	if (ti->surface_listener_attached_to)
++		wl_list_remove(&ti->surface_destroy_listener.link);
++
++	wl_list_remove(&ti->link);
++	bridge_notify_state(ti->bridge);
++	free(ti);
++}
++
++static void
++manager_get_text_input(struct wl_client *client,
++		       struct wl_resource *manager_resource,
++		       uint32_t id,
++		       struct wl_resource *seat_resource)
++{
++	struct ti_bridge *bridge = wl_resource_get_user_data(manager_resource);
++	struct weston_seat *seat = wl_resource_get_user_data(seat_resource);
++	struct bridge_text_input *ti;
++
++	ti = zalloc(sizeof *ti);
++	if (!ti) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++
++	ti->bridge = bridge;
++	ti->seat = seat;
++	wl_list_init(&ti->link);
++	wl_list_insert(bridge->text_inputs.prev, &ti->link);
++
++	ti->resource = wl_resource_create(client,
++					  &zwp_text_input_v3_interface,
++					  wl_resource_get_version(manager_resource),
++					  id);
++	if (!ti->resource) {
++		wl_list_remove(&ti->link);
++		free(ti);
++		wl_client_post_no_memory(client);
++		return;
++	}
++
++	wl_resource_set_implementation(ti->resource, &ti_implementation, ti,
++				       ti_unbind);
++
++	ti_update_focus(ti);
++}
++
++static void
++manager_destroy(struct wl_client *client, struct wl_resource *resource)
++{
++	wl_resource_destroy(resource);
++}
++
++static const struct zwp_text_input_manager_v3_interface
++manager_implementation = {
++	.destroy = manager_destroy,
++	.get_text_input = manager_get_text_input,
++};
++
++static void
++bind_text_input_manager(struct wl_client *client, void *data, uint32_t version,
++			uint32_t id)
++{
++	struct ti_bridge *bridge = data;
++	struct wl_resource *resource;
++
++	resource = wl_resource_create(client,
++				      &zwp_text_input_manager_v3_interface,
++				      version, id);
++	if (!resource) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++
++	wl_resource_set_implementation(resource, &manager_implementation,
++				       bridge, NULL);
++}
++
++static void
++bridge_destroy(struct wl_listener *listener, void *data)
++{
++	struct ti_bridge *bridge =
++		container_of(listener, struct ti_bridge, destroy_listener);
++
++	wl_list_remove(&bridge->destroy_listener.link);
++
++	if (bridge->manager_global)
++		wl_global_destroy(bridge->manager_global);
++
++	if (g_bridge == bridge)
++		g_bridge = NULL;
++
++	free(bridge);
++}
++
++static struct bridge_text_input *
++bridge_find_active(struct ti_bridge *bridge)
++{
++	struct bridge_text_input *ti;
++
++	wl_list_for_each(ti, &bridge->text_inputs, link) {
++		struct weston_keyboard *keyboard = ti_get_keyboard(ti);
++
++		if (ti->enabled && ti->surface && keyboard &&
++		    keyboard->focus == ti->surface)
++			return ti;
++	}
++
++	return NULL;
++}
++
++static bool
++bridge_api_get_active(struct weston_compositor *ec,
++		      struct weston_surface **out_surface)
++{
++	struct bridge_text_input *ti;
++
++	if (!g_bridge || g_bridge->ec != ec)
++		return false;
++
++	ti = bridge_find_active(g_bridge);
++	if (out_surface)
++		*out_surface = ti ? ti->surface : NULL;
++
++	return ti != NULL;
++}
++
++static bool
++bridge_api_get_cursor_rect(struct weston_compositor *ec,
++			   int32_t *x, int32_t *y,
++			   int32_t *width, int32_t *height)
++{
++	struct bridge_text_input *ti;
++
++	if (!g_bridge || g_bridge->ec != ec)
++		return false;
++
++	ti = bridge_find_active(g_bridge);
++	if (!ti || !ti->have_cursor_rect)
++		return false;
++
++	*x = ti->cursor_x;
++	*y = ti->cursor_y;
++	*width = ti->cursor_w;
++	*height = ti->cursor_h;
++	return true;
++}
++
++static void
++bridge_api_send_preedit(struct weston_compositor *ec, const char *text,
++			int32_t cursor_begin, int32_t cursor_end)
++{
++	struct bridge_text_input *ti;
++	size_t len;
++
++	if (!g_bridge || g_bridge->ec != ec)
++		return;
++
++	ti = bridge_find_active(g_bridge);
++	if (!ti)
++		return;
++
++	if (!text)
++		text = "";
++
++	if (cursor_begin < 0 || cursor_end < 0) {
++		len = strlen(text);
++		cursor_begin = (int32_t)len;
++		cursor_end = (int32_t)len;
++	}
++
++	zwp_text_input_v3_send_preedit_string(ti->resource, text,
++					      cursor_begin, cursor_end);
++	bridge_send_done(ti);
++}
++
++static void
++bridge_api_send_commit(struct weston_compositor *ec, const char *text)
++{
++	struct bridge_text_input *ti;
++
++	if (!g_bridge || g_bridge->ec != ec)
++		return;
++
++	ti = bridge_find_active(g_bridge);
++	if (!ti)
++		return;
++
++	if (!text)
++		text = "";
++
++	zwp_text_input_v3_send_preedit_string(ti->resource, "", 0, 0);
++	zwp_text_input_v3_send_commit_string(ti->resource, text);
++	bridge_send_done(ti);
++}
++
++static void
++bridge_api_set_state_listener(struct weston_compositor *ec,
++			      void (*cb)(bool active,
++					 struct weston_surface *surface,
++					 void *user_data),
++			      void *user_data)
++{
++	if (!g_bridge || g_bridge->ec != ec)
++		return;
++
++	g_bridge->state_cb = cb;
++	g_bridge->state_cb_user_data = user_data;
++}
++
++static const struct weston_text_input_bridge_api bridge_api = {
++	.get_active = bridge_api_get_active,
++	.get_cursor_rect = bridge_api_get_cursor_rect,
++	.send_preedit = bridge_api_send_preedit,
++	.send_commit = bridge_api_send_commit,
++	.set_state_listener = bridge_api_set_state_listener,
++};
++
++int
++text_input_bridge_init(struct weston_compositor *ec)
++{
++	struct ti_bridge *bridge;
++	int ret;
++
++	if (g_bridge) {
++		weston_log("text-input-bridge: already initialized\n");
++		return 0;
++	}
++
++	bridge = zalloc(sizeof *bridge);
++	if (!bridge)
++		return -1;
++
++	bridge->ec = ec;
++	wl_list_init(&bridge->text_inputs);
++	bridge->destroy_listener.notify = bridge_destroy;
++	wl_signal_add(&ec->destroy_signal, &bridge->destroy_listener);
++
++	bridge->manager_global =
++		wl_global_create(ec->wl_display,
++				 &zwp_text_input_manager_v3_interface, 1,
++				 bridge, bind_text_input_manager);
++	if (!bridge->manager_global) {
++		wl_list_remove(&bridge->destroy_listener.link);
++		free(bridge);
++		return -1;
++	}
++
++	ret = weston_plugin_api_register(ec,
++					 WESTON_TEXT_INPUT_BRIDGE_API_NAME,
++					 &bridge_api, sizeof(bridge_api));
++	if (ret < 0) {
++		weston_log("text-input-bridge: failed to register plugin API\n");
++		wl_global_destroy(bridge->manager_global);
++		wl_list_remove(&bridge->destroy_listener.link);
++		free(bridge);
++		return -1;
++	}
++
++	g_bridge = bridge;
++
++	weston_log("text-input-bridge: zwp_text_input_v3 support enabled\n");
++	return 0;
++}
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/include/libweston/libweston.h pickle-rdp-live/weston-16.0.2/include/libweston/libweston.h
+--- _release-upstream/weston-16.0.2/include/libweston/libweston.h	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/include/libweston/libweston.h	2026-11-22 05:52:03.129843496 +0000
+@@ -2549,6 +2549,11 @@
+ void
+ weston_compositor_destroy(struct weston_compositor *ec);
+ 
++/* The global's bind callback must accept NULL data for removed objects. */
++void
++weston_global_destroy_safe(struct weston_compositor *compositor,
++			   struct wl_global *global);
++
+ struct weston_compositor *
+ weston_compositor_create(struct wl_display *display,
+ 			 struct weston_log_context *log_ctx, void *user_data,
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/include/libweston/text-input-bridge.h pickle-rdp-live/weston-16.0.2/include/libweston/text-input-bridge.h
+--- _release-upstream/weston-16.0.2/include/libweston/text-input-bridge.h	1970-01-01 00:00:00.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/include/libweston/text-input-bridge.h	2026-11-22 05:46:40.539170528 +0000
+@@ -0,0 +1,45 @@
++#ifndef WESTON_TEXT_INPUT_BRIDGE_H
++#define WESTON_TEXT_INPUT_BRIDGE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct weston_compositor;
++struct weston_surface;
++
++#define WESTON_TEXT_INPUT_BRIDGE_API_NAME "weston_text_input_bridge_v1"
++#define WESTON_TEXT_INPUT_BRIDGE_API_VERSION 1
++
++struct weston_text_input_bridge_api {
++	bool (*get_active)(struct weston_compositor *ec,
++			   struct weston_surface **out_surface);
++
++	bool (*get_cursor_rect)(struct weston_compositor *ec,
++				int32_t *x, int32_t *y,
++				int32_t *width, int32_t *height);
++
++	void (*send_preedit)(struct weston_compositor *ec,
++			     const char *text,
++			     int32_t cursor_begin, int32_t cursor_end);
++
++	void (*send_commit)(struct weston_compositor *ec, const char *text);
++
++	void (*set_state_listener)(struct weston_compositor *ec,
++				   void (*cb)(bool active,
++					      struct weston_surface *surface,
++					      void *user_data),
++				   void *user_data);
++};
++
++
++int text_input_bridge_init(struct weston_compositor *ec);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/libweston/backend-rdp/meson.build pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/meson.build
+--- _release-upstream/weston-16.0.2/libweston/backend-rdp/meson.build	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/meson.build	2026-11-22 09:54:08.877065493 +0000
+@@ -46,9 +46,11 @@
+         dep_frdp_server,
+         dep_wpr,
+         dep_libdrm_headers,
++        dependency('libhangul', required: true),
+ ]
+ srcs_rdp = [
+         'rdp.c',
++        'rdptext.c',
+         'rdpclip.c',
+         'rdpdisp.c',
+         'rdputil.c',
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/libweston/backend-rdp/rdp.c pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdp.c
+--- _release-upstream/weston-16.0.2/libweston/backend-rdp/rdp.c	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdp.c	2026-11-22 10:13:55.630859709 +0000
+@@ -850,6 +850,7 @@
+ 	if (context->audio_out_private)
+ 		b->audio_out_teardown(context->audio_out_private);
+ 
++	rdp_rdptext_destroy(context);
+ 	rdp_clipboard_destroy(context);
+ 
+ 	if (context->vcm)
+@@ -884,10 +885,22 @@
+ 
+ 	if (peerCtx && peerCtx->vcm)
+ 	{
+-		if (!WTSVirtualChannelManagerCheckFileDescriptor(peerCtx->vcm)) {
++		BOOL channels_ok;
++
++#if USE_FREERDP_VERSION >= 3
++		/* FreeRDP marks drdynvc initialized even if its static channel
++		 * has not joined yet. Drain queues early, but open only once
++		 * activation confirms that channel negotiation has finished. */
++		channels_ok = WTSVirtualChannelManagerCheckFileDescriptorEx(
++			peerCtx->vcm, !!(peerCtx->item.flags & RDP_PEER_ACTIVATED));
++#else
++		channels_ok = WTSVirtualChannelManagerCheckFileDescriptor(peerCtx->vcm);
++#endif
++		if (!channels_ok) {
+ 			weston_log("failed to check FreeRDP WTS VC file descriptor for %p\n", client);
+ 			goto out_clean;
+ 		}
++		rdp_rdptext_process(peerCtx);
+ 	}
+ 
+ 	return 0;
+@@ -1230,9 +1243,12 @@
+ 
+ 	peersItem->flags |= RDP_PEER_ACTIVATED;
+ 
+-	/* disable pointer on the client side */
++	if (rdp_rdptext_init(client) < 0)
++		weston_log("rdptext: bridge unavailable for peer\n");
++
++	/* Display cursor locally to avoid the remote video round trip. */
+ 	pointer = client->context->update->pointer;
+-	pointer_system.type = SYSPTR_NULL;
++	pointer_system.type = SYSPTR_DEFAULT;
+ 	pointer->PointerSystem(client->context, &pointer_system);
+ 
+ 	rdp_full_refresh(client, output);
+@@ -1656,6 +1672,12 @@
+ 			if (flags & KBD_FLAGS_EXTENDED)
+ 				vk_code |= KBDEXT;
+ 
++		/* The Android text relay composes Korean on the RDP host. */
++		if (rdp_rdptext_scancode_key(peerContext, flags, vk_code,
++					   (freerdp_settings_get_uint32(client->context->settings,
++					    FreeRDP_KeyboardLayout) & 0xFFFF) == 0x0412))
++			return TRUE;
++
+ 		scan_code = GetKeycodeFromVirtualKeyCode(vk_code, WINPR_KEYCODE_TYPE_XKB);
+ 
+ 		/*weston_log("code=%x ext=%d vk_code=%x scan_code=%x\n", code, (flags & KBD_FLAGS_EXTENDED) ? 1 : 0,
+@@ -1685,6 +1707,7 @@
+ 	struct rdp_backend *b = peerContext->rdpBackend;
+ 
+ 	rdp_debug(b, "Client sent a unicode keyboard event (flags:0x%X code:0x%X)\n", flags, code);
++	rdp_rdptext_unicode_key(peerContext, flags, code);
+ 
+ 	return TRUE;
+ }
+@@ -1840,6 +1863,9 @@
+ 			goto error_initialize;
+ 		if (!freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerRsaKey, key, 1))
+ 			goto error_initialize;
++		/* Extended security also uses CredSSP, so it follows NLA. */
++		if (!freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, b->nla_enabled))
++			goto error_initialize;
+ 		if (b->nla_enabled) {
+ 			if (!freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, b->nla_ntlm_db)) {
+ 				rdp_debug(b, "Error setting FreeRDP_NtlmSamFile to '%s'.\n", b->nla_ntlm_db);
+@@ -1929,6 +1955,7 @@
+ 	freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, TRUE);
+ 	freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled, TRUE);
+ 	freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, TRUE);
++	freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, TRUE);
+ 	freerdp_settings_set_bool(settings, FreeRDP_HasExtendedMouseEvent, TRUE);
+ 	freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, TRUE);
+ 
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/libweston/backend-rdp/rdp.h pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdp.h
+--- _release-upstream/weston-16.0.2/libweston/backend-rdp/rdp.h	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdp.h	2026-11-22 09:54:10.362637792 +0000
+@@ -174,6 +174,7 @@
+ 	int horizontalAccumWheelRotationDiscrete;
+ 
+ 	HANDLE vcm;
++	struct rdptext_state *rdptext;
+ 
+ 	/* list of outstanding event_source sent from FreeRDP thread to display loop.*/
+ 	int loop_task_event_source_fd;
+@@ -275,6 +276,14 @@
+ void
+ rdp_clipboard_destroy(RdpPeerContext *peerCtx);
+ 
++/* Community text-input bridge, adapted to desktop RDP. */
++int rdp_rdptext_init(freerdp_peer *client);
++void rdp_rdptext_process(RdpPeerContext *peer_ctx);
++void rdp_rdptext_destroy(RdpPeerContext *peer_ctx);
++void rdp_rdptext_unicode_key(RdpPeerContext *peer_ctx, UINT16 flags, UINT16 code);
++bool rdp_rdptext_scancode_key(RdpPeerContext *peer_ctx, UINT16 flags, UINT32 vk_code, bool korean_layout);
++bool rdp_rdptext_suppress_legacy_keys(RdpPeerContext *peer_ctx);
++
+ /* rdp.c */
+ void
+ rdp_head_create(struct rdp_backend *backend, rdpMonitor *config);
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/libweston/backend-rdp/rdpclip.c pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdpclip.c
+--- _release-upstream/weston-16.0.2/libweston/backend-rdp/rdpclip.c	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdpclip.c	2026-11-22 05:57:13.478516724 +0000
+@@ -1714,6 +1714,12 @@
+ 
+ 	assert_compositor_thread(b);
+ 
++	/* Clipboard is optional; peers may deliberately omit cliprdr. */
++	if (!WTSVirtualChannelManagerIsChannelJoined(ctx->vcm, "cliprdr")) {
++		weston_log("RDP peer did not join cliprdr; clipboard unavailable\n");
++		return 0;
++	}
++
+ 	ctx->clipboard_server_context = cliprdr_server_context_new(ctx->vcm);
+ 	if (!ctx->clipboard_server_context)
+ 		goto error;
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/libweston/backend-rdp/rdptext.c pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdptext.c
+--- _release-upstream/weston-16.0.2/libweston/backend-rdp/rdptext.c	1970-01-01 00:00:00.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/libweston/backend-rdp/rdptext.c	2026-11-22 11:05:35.779770409 +0000
+@@ -0,0 +1,2196 @@
++#include <config.h>
++
++#include <inttypes.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <freerdp/freerdp.h>
++#include <freerdp/channels/wtsvc.h>
++#include <hangul.h>
++
++#include <libweston/libweston.h>
++#include <libweston/plugin-registry.h>
++#include <libweston/text-input-bridge.h>
++
++#include "rdp.h"
++
++#define RDPTXT_CHANNEL_S2C "WSL::TextBridge::ServerToClient"
++#define RDPTXT_CHANNEL_C2S "WSL::TextBridge::ClientToServer"
++
++#define RDPTXT_HEADER_SIZE 6
++#define RDPTXT_VERSION_MAJOR 1
++#define RDPTXT_VERSION_MINOR 7
++
++#define RDPTXT_READY_TIMEOUT_TICKS 600
++
++#define RDPTXT_MAX_TEXT_UNITS 65536
++#define RDPTXT_MAX_CLAUSES 64
++#define RDPTXT_MAX_KEYSTATS 1024
++#define RDPTXT_MAX_PDU_SIZE (1024 * 1024)
++
++#define RDPTXT_TEXT_TARGET_ID 1
++#define RDPTXT_HOST_ID 1
++#define RDPTXT_EDIT_CONTROL_ID 1
++
++#define RDPTXT_HOST_TYPE_LEGACY 3
++
++#define RDPTXT_PDU_KEY_EVENT                       0x0100
++#define RDPTXT_PDU_ACKNOWLEDGE_HOST_OPERATION      0x0101
++#define RDPTXT_PDU_CHARACTER_EVENT                 0x0102
++#define RDPTXT_PDU_ENABLE_WINDOW                   0x0105
++#define RDPTXT_PDU_UPDATE_TEXT                     0x0200
++#define RDPTXT_PDU_UPDATE_TEXT_AND_SELECTION       0x0201
++#define RDPTXT_PDU_SET_SELECTION                   0x0202
++#define RDPTXT_PDU_UPDATE_FORMAT                   0x0203
++#define RDPTXT_PDU_UPDATE_COMPOSITION              0x0204
++#define RDPTXT_PDU_SET_COMPOSITION_INFO            0x0205
++#define RDPTXT_PDU_RECONVERSION_CANDIDATES         0x0206
++#define RDPTXT_PDU_UPDATE_INPUT_PROFILE            0x0208
++#define RDPTXT_PDU_UPDATE_MODE                     0x0209
++#define RDPTXT_PDU_SET_CONVERSION_MODE             0x020A
++#define RDPTXT_PDU_ACKNOWLEDGE_OPERATION           0x020B
++#define RDPTXT_PDU_ERROR_REPORT                    0x020C
++#define RDPTXT_PDU_REGISTER_REMOTE_TEXT_TARGET     0x0300
++#define RDPTXT_PDU_REGISTER_REMOTE_KEY_TARGET      0x0301
++#define RDPTXT_PDU_REGISTER_REMOTE_EDIT_CONTROL    0x0302
++#define RDPTXT_PDU_UNREGISTER_REMOTE_EDIT_CONTROL  0x0306
++#define RDPTXT_PDU_EDIT_CONTROL_FOCUS              0x0308
++#define RDPTXT_PDU_HOST_FOCUS                      0x0309
++#define RDPTXT_PDU_HOST_FOREGROUND                 0x030A
++#define RDPTXT_PDU_SELECTION_CHANGED               0x030B
++#define RDPTXT_PDU_TEXT_CHANGED                    0x030C
++#define RDPTXT_PDU_GEOMETRY_CHANGED                0x030F
++#define RDPTXT_PDU_NOTIFY_SERVER_VERSION           0x031A
++#define RDPTXT_PDU_ACKNOWLEDGE_REMOTE_OPERATION    0x0312
++#define RDPTXT_PDU_ACKNOWLEDGE_KEY_EVENT           0x0313
++#define RDPTXT_PDU_INPUT_PROFILE_CHANGED           0x0314
++#define RDPTXT_PDU_REMOTE_TEXT_TARGET_THREAD_PROPS 0x0322
++#define RDPTXT_PDU_OCCLUDING_VIEWS                 0x0400
++#define RDPTXT_PDU_REMOTE_INTEGRATION_STATUS       0x0602
++#define RDPTXT_PDU_REREGISTRATION_REQUEST          0x0603
++#define RDPTXT_PDU_NOTIFY_CLIENT_VERSION           0x0604
++#define RDPTXT_PDU_REPORT_CLIENT_OPTIONS           0x0605
++
++#define RDPTXT_FEATURE_PREDICTION_MODE        0x00000001
++#define RDPTXT_FEATURE_LAYOUT_CHANGE_TRACKING 0x00000004
++#define RDPTXT_FEATURE_SELECTION_TRACKING     0x00000008
++
++#define RDPTXT_COMPOSITION_ENTER  0x01
++#define RDPTXT_COMPOSITION_LEAVE  0x02
++#define RDPTXT_COMPOSITION_UPDATE 0x03
++
++#define RDPTXT_KEY_ROUTING_NONE 0x02
++
++#define RDPTXT_KEY_FLAG_DOWN 0x0001
++#define RDPTXT_KEY_FLAG_UP   0x0004
++
++#define RDPTXT_KEY_ACK_COMPLETED 0x00000001
++
++struct rdptext_state {
++	RdpPeerContext *peer_ctx;
++	HANDLE s2c_channel;
++	HANDLE c2s_channel;
++	DWORD session_id;
++	bool channels_open_attempted;
++	int last_drdynvc_state;
++
++	bool version_sent;
++	bool client_version_received;
++	bool ready_failed;
++	uint32_t ready_ticks;
++	uint32_t client_version_major;
++	uint32_t client_version_minor;
++
++	bool registered;
++	bool integration_enabled;
++	bool client_integration_status;
++	bool window_input_enabled;
++	bool focus_notified;
++	struct weston_surface *focused_surface;
++
++	uint32_t host_focus_ordinal;
++	uint32_t window_id;
++	uint32_t notify_op_id;
++	uint32_t client_buf_len;
++
++	UINT16 unicode_high_surrogate;
++	HangulInputContext *hangul_input;
++	bool hangul_mode;
++	bool shift_down;
++	bool ctrl_down;
++	bool alt_down;
++	bool space_toggle_owned;
++	bool backspace_owned;
++	bool composition_active;
++	bool skip_identical_update_text;
++	char *pending_commit;
++	char *last_commit_text;
++
++	const struct weston_text_input_bridge_api *bridge_api;
++	bool bridge_listener_attached;
++
++	bool verbose;
++	int c2s_dump_count;
++};
++
++static void
++rdptext_log(struct rdptext_state *t, const char *fmt, ...)
++{
++	va_list ap;
++	char buf[512];
++
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++
++	(void)t;
++	weston_log("rdptext: %s\n", buf);
++}
++
++#define rdptext_verbose(t, ...) \
++	do { \
++		if ((t) && (t)->verbose) \
++			rdptext_log(t, __VA_ARGS__); \
++	} while (0)
++
++static void
++rdptext_hex_dump(struct rdptext_state *t, const unsigned char *data,
++		 size_t len)
++{
++	char buf[3 * 32 + 8];
++	size_t i, n = len < 32 ? len : 32;
++
++	(void)t;
++	for (i = 0; i < n; i++)
++		snprintf(buf + 3 * i, 4, "%02X ", data[i]);
++	buf[3 * n] = '\0';
++	weston_log("rdptext:   bytes: %s (%zu bytes total)\n", buf, len);
++}
++
++static char *
++rdptext_utf16_to_utf8(const UINT16 *wstr, size_t wchars)
++{
++	size_t i, out = 0;
++	unsigned char *buf;
++
++	buf = malloc(wchars * 3 + 1);
++	if (!buf)
++		return NULL;
++
++	for (i = 0; i < wchars; i++) {
++		uint32_t cp = wstr[i];
++
++		if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < wchars &&
++		    wstr[i + 1] >= 0xDC00 && wstr[i + 1] <= 0xDFFF) {
++			cp = 0x10000 + ((cp - 0xD800) << 10) + (wstr[++i] - 0xDC00);
++		} else if (cp >= 0xD800 && cp <= 0xDFFF) {
++			cp = 0xFFFD;
++		}
++
++		if (cp < 0x80) {
++			buf[out++] = (unsigned char)cp;
++		} else if (cp < 0x800) {
++			buf[out++] = 0xC0 | (cp >> 6);
++			buf[out++] = 0x80 | (cp & 0x3F);
++		} else if (cp < 0x10000) {
++			buf[out++] = 0xE0 | (cp >> 12);
++			buf[out++] = 0x80 | ((cp >> 6) & 0x3F);
++			buf[out++] = 0x80 | (cp & 0x3F);
++		} else {
++			buf[out++] = 0xF0 | (cp >> 18);
++			buf[out++] = 0x80 | ((cp >> 12) & 0x3F);
++			buf[out++] = 0x80 | ((cp >> 6) & 0x3F);
++			buf[out++] = 0x80 | (cp & 0x3F);
++		}
++	}
++	buf[out] = '\0';
++	return (char *)buf;
++}
++
++static UINT16 *
++rdptext_utf8_to_utf16(const char *utf8, size_t *out_wchars)
++{
++	unsigned char *s = (unsigned char *)utf8;
++	UINT16 *buf;
++	size_t len = strlen(utf8);
++	size_t i = 0, out = 0;
++
++	buf = malloc((len + 1) * sizeof(UINT16));
++	if (!buf)
++		return NULL;
++
++	while (i < len) {
++		uint32_t cp;
++		unsigned char c = s[i];
++
++		if (c < 0x80) {
++			cp = c;
++			i += 1;
++		} else if ((c & 0xE0) == 0xC0 && i + 1 < len) {
++			cp = ((c & 0x1F) << 6) | (s[i + 1] & 0x3F);
++			i += 2;
++		} else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
++			cp = ((c & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) |
++			     (s[i + 2] & 0x3F);
++			i += 3;
++		} else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
++			cp = ((c & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12) |
++			     ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
++			i += 4;
++		} else {
++			cp = 0xFFFD;
++			i += 1;
++		}
++
++		if (cp >= 0x10000) {
++			cp -= 0x10000;
++			buf[out++] = 0xD800 | (cp >> 10);
++			buf[out++] = 0xDC00 | (cp & 0x3FF);
++		} else {
++			buf[out++] = (UINT16)cp;
++		}
++	}
++
++	buf[out] = 0;
++	if (out_wchars)
++		*out_wchars = out;
++	return buf;
++}
++
++static BOOL
++rdptext_channel_is_ready(HANDLE channel)
++{
++	BOOL ready = FALSE;
++	PVOID buffer = NULL;
++	DWORD bytes_returned = 0;
++
++	if (!channel)
++		return FALSE;
++
++	if (!WTSVirtualChannelQuery(channel, WTSVirtualChannelReady,
++				    &buffer, &bytes_returned))
++		return FALSE;
++
++	if (buffer && bytes_returned == sizeof(BOOL))
++		ready = *((BOOL *)buffer);
++
++	WTSFreeMemory(buffer);
++	return ready;
++}
++
++static BOOL
++rdptext_send_pdu(struct rdptext_state *t, HANDLE channel, UINT16 pdu_id,
++		 const void *payload, UINT32 payload_len)
++{
++	wStream *s;
++	ULONG written;
++	BOOL ret;
++
++	s = Stream_New(NULL, RDPTXT_HEADER_SIZE + payload_len);
++	if (!s)
++		return FALSE;
++
++	Stream_Write_UINT32(s, 2 + payload_len);
++	Stream_Write_UINT16(s, pdu_id);
++	if (payload_len)
++		Stream_Write(s, payload, payload_len);
++
++	ret = WTSVirtualChannelWrite(channel, (PCHAR)Stream_Buffer(s),
++				     Stream_GetPosition(s), &written);
++	Stream_Free(s, TRUE);
++
++	if (!ret)
++		rdptext_log(t, "failed to send PDU 0x%04X", pdu_id);
++
++	return ret;
++}
++
++static BOOL
++rdptext_s2c_ok(struct rdptext_state *t)
++{
++	return t->integration_enabled && t->window_input_enabled &&
++	       t->s2c_channel;
++}
++
++static void
++rdptext_send_server_version(struct rdptext_state *t)
++{
++	wStream *payload;
++	unsigned char zeros[16] = { 0 };
++	BOOL ret;
++
++	payload = Stream_New(NULL, 24);
++	if (!payload)
++		return;
++
++	Stream_Write(payload, zeros, sizeof(zeros));
++	Stream_Write_UINT32(payload, RDPTXT_VERSION_MAJOR);
++	Stream_Write_UINT32(payload, RDPTXT_VERSION_MINOR);
++
++	ret = rdptext_send_pdu(t, t->s2c_channel,
++			       RDPTXT_PDU_NOTIFY_SERVER_VERSION,
++			       Stream_Buffer(payload), 24);
++	Stream_Free(payload, TRUE);
++
++	rdptext_log(t, "sent NOTIFY_SERVER_VERSION %u.%u (ret=%d)",
++		    RDPTXT_VERSION_MAJOR, RDPTXT_VERSION_MINOR, ret);
++}
++
++static void
++rdptext_send_register_text_target(struct rdptext_state *t)
++{
++	wStream *s;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 4);
++	if (!s)
++		return;
++	Stream_Write_UINT32(s, RDPTXT_TEXT_TARGET_ID);
++
++	rdptext_send_pdu(t, t->s2c_channel,
++			 RDPTXT_PDU_REGISTER_REMOTE_TEXT_TARGET,
++			 Stream_Buffer(s), 4);
++	Stream_Free(s, TRUE);
++}
++
++static void
++rdptext_send_register_key_target(struct rdptext_state *t)
++{
++	wStream *s;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 31);
++	if (!s)
++		return;
++	Stream_Write_UINT32(s, RDPTXT_HOST_ID);
++	Stream_Write_UINT32(s, RDPTXT_TEXT_TARGET_ID);
++	Stream_Write_UINT32(s, RDPTXT_HOST_TYPE_LEGACY);
++	Stream_Write_UINT8(s, 1);
++	Stream_Write_UINT8(s, 1);
++	Stream_Write_UINT8(s, 0);
++	Stream_Write_UINT64(s, t->window_id);
++	Stream_Write_UINT64(s, t->window_id);
++
++	rdptext_send_pdu(t, t->s2c_channel,
++			 RDPTXT_PDU_REGISTER_REMOTE_KEY_TARGET,
++			 Stream_Buffer(s), 31);
++	Stream_Free(s, TRUE);
++}
++
++static void
++rdptext_send_register_edit_control(struct rdptext_state *t)
++{
++	wStream *s;
++	UINT16 *app_name;
++	size_t name_wchars = 0;
++	UINT32 payload_len;
++	static const char app_name_utf8[] = "weston";
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	app_name = rdptext_utf8_to_utf16(app_name_utf8, &name_wchars);
++	if (!app_name)
++		return;
++
++	payload_len = 4 + (UINT32)(name_wchars * 2) + 12;
++
++	s = Stream_New(NULL, payload_len);
++	if (!s) {
++		free(app_name);
++		return;
++	}
++
++	Stream_Write_UINT32(s, (UINT32)name_wchars);
++	Stream_Write(s, app_name, name_wchars * 2);
++	Stream_Write_UINT32(s, ++t->host_focus_ordinal);
++	Stream_Write_UINT32(s, RDPTXT_EDIT_CONTROL_ID);
++	Stream_Write_UINT32(s, RDPTXT_TEXT_TARGET_ID);
++
++	rdptext_send_pdu(t, t->s2c_channel,
++			 RDPTXT_PDU_REGISTER_REMOTE_EDIT_CONTROL,
++			 Stream_Buffer(s), payload_len);
++	Stream_Free(s, TRUE);
++	free(app_name);
++}
++
++static void
++rdptext_send_thread_properties(struct rdptext_state *t)
++{
++	wStream *s;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 8);
++	if (!s)
++		return;
++	Stream_Write_UINT32(s, RDPTXT_TEXT_TARGET_ID);
++	Stream_Write_UINT32(s, 0x00000001);
++
++	rdptext_send_pdu(t, t->s2c_channel,
++			 RDPTXT_PDU_REMOTE_TEXT_TARGET_THREAD_PROPS,
++			 Stream_Buffer(s), 8);
++	Stream_Free(s, TRUE);
++}
++
++static void
++rdptext_send_host_foreground(struct rdptext_state *t)
++{
++	wStream *s;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 12);
++	if (!s)
++		return;
++	Stream_Write_UINT32(s, RDPTXT_HOST_ID);
++	Stream_Write_UINT64(s, t->window_id);
++
++	rdptext_send_pdu(t, t->s2c_channel, RDPTXT_PDU_HOST_FOREGROUND,
++			 Stream_Buffer(s), 12);
++	Stream_Free(s, TRUE);
++}
++
++static void
++rdptext_send_host_focus(struct rdptext_state *t, bool gaining)
++{
++	wStream *s;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 10);
++	if (!s)
++		return;
++	Stream_Write_UINT32(s, RDPTXT_HOST_ID);
++	Stream_Write_UINT32(s, ++t->host_focus_ordinal);
++	Stream_Write_UINT8(s, gaining ? 1 : 0);
++	Stream_Write_UINT8(s, 0);
++
++	rdptext_send_pdu(t, t->s2c_channel, RDPTXT_PDU_HOST_FOCUS,
++			 Stream_Buffer(s), 10);
++	Stream_Free(s, TRUE);
++}
++
++static bool
++rdptext_surface_bounds(struct rdptext_state *t, struct weston_surface *surface,
++                      int32_t x, int32_t y, int32_t w, int32_t h,
++                      pixman_box32_t *bounds)
++{
++	struct weston_view *view;
++	struct weston_head *head;
++	struct weston_output *output;
++	struct weston_coord_global start, end;
++	struct rdp_head *rdp_head;
++
++	if (!surface || w <= 0 || h <= 0)
++		return false;
++	wl_list_for_each(view, &surface->views, surface_link) {
++		output = view->output;
++		if (!output)
++			continue;
++		wl_list_for_each(head, &output->head_list, output_link) {
++			rdp_head = to_rdp_head(head);
++			if (!rdp_head)
++				continue;
++			start = weston_coord_surface_to_global(view,
++				weston_coord_surface(x, y, surface));
++			end = weston_coord_surface_to_global(view,
++				weston_coord_surface(x + w, y + h, surface));
++			bounds->x1 = (start.c.x - output->pos.c.x) * output->current_scale + rdp_head->config.x;
++			bounds->y1 = (start.c.y - output->pos.c.y) * output->current_scale + rdp_head->config.y;
++			bounds->x2 = (end.c.x - output->pos.c.x) * output->current_scale + rdp_head->config.x;
++			bounds->y2 = (end.c.y - output->pos.c.y) * output->current_scale + rdp_head->config.y;
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++rdptext_get_cursor_bounds(struct rdptext_state *t, struct weston_surface *surface,
++                          pixman_box32_t *bounds)
++{
++	int32_t x, y, w, h;
++	if (!t->bridge_api || !t->bridge_api->get_cursor_rect(
++			t->peer_ctx->rdpBackend->compositor, &x, &y, &w, &h))
++		return false;
++	return rdptext_surface_bounds(t, surface, x, y, w ? w : 1, h, bounds);
++}
++
++static bool
++rdptext_get_control_bounds(struct rdptext_state *t, struct weston_surface *surface,
++                           pixman_box32_t *bounds)
++{
++	return surface && rdptext_surface_bounds(t, surface, 0, 0,
++		surface->width, surface->height, bounds);
++}
++
++static bool
++rdptext_get_caret_control_bounds(struct rdptext_state *t,
++				 struct weston_surface *surface,
++				 pixman_box32_t *bounds)
++{
++	pixman_box32_t caret;
++	int32_t w, top;
++
++	if (!surface)
++		return false;
++	if (!rdptext_get_cursor_bounds(t, surface, &caret))
++		return rdptext_get_control_bounds(t, surface, bounds);
++	if (!rdptext_get_control_bounds(t, surface, bounds))
++		return false;
++
++	w = bounds->x2 - bounds->x1;
++	if (w < 800)
++		w = 800;
++	top = bounds->y1;
++
++	bounds->x1 = caret.x1 - w / 2;
++	bounds->x2 = caret.x1 + w / 2;
++	bounds->y1 = top;
++	bounds->y2 = caret.y2;
++
++	if (bounds->x2 <= bounds->x1 || bounds->y2 <= bounds->y1)
++		return false;
++
++	return true;
++}
++
++static void
++	rdptext_send_edit_control_focus(struct rdptext_state *t, bool gaining,
++					struct weston_surface *surface)
++{
++	wStream *s;
++	pixman_box32_t bounds;
++	bool have_bounds = false;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 66);
++	if (!s)
++		return;
++
++	if (gaining && surface)
++		have_bounds = rdptext_get_caret_control_bounds(t, surface, &bounds);
++
++	Stream_Write_UINT32(s, RDPTXT_TEXT_TARGET_ID);
++	if (have_bounds) {
++		Stream_Write_UINT32(s, (UINT32)bounds.x1);
++		Stream_Write_UINT32(s, (UINT32)bounds.y1);
++		Stream_Write_UINT32(s, (UINT32)bounds.x2);
++		Stream_Write_UINT32(s, (UINT32)bounds.y2);
++	} else {
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++	}
++
++	Stream_Write_UINT32(s, 0xFFFFFFFF);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT32(s, RDPTXT_HOST_TYPE_LEGACY);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT32(s, RDPTXT_EDIT_CONTROL_ID);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT64(s, 0);
++
++	Stream_Write_UINT8(s, gaining ? 1 : 0);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT8(s, 0);
++
++	rdptext_send_pdu(t, t->s2c_channel, RDPTXT_PDU_EDIT_CONTROL_FOCUS,
++			 Stream_Buffer(s), 66);
++	Stream_Free(s, TRUE);
++
++	rdptext_log(t, "EDIT_CONTROL_FOCUS %s bounds:%d",
++		    gaining ? "gained" : "lost", have_bounds);
++}
++
++static void
++	rdptext_send_text_changed(struct rdptext_state *t,
++				  const UINT16 *text16, UINT32 text16_len)
++{
++	wStream *s;
++	const size_t keystates_size = 256;
++	size_t len;
++	UINT32 caret = t->client_buf_len + text16_len;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	len = 4 + 4 + 8 + 8 + 4 + 4 + 44 + 1 + 1 +
++	      4 + 4 + text16_len * 2 + 4 + 4 + 4 + keystates_size;
++	s = Stream_New(NULL, len);
++	if (!s)
++		return;
++
++	Stream_Write_UINT32(s, RDPTXT_TEXT_TARGET_ID);
++	Stream_Write_UINT32(s, RDPTXT_EDIT_CONTROL_ID);
++	Stream_Write_UINT32(s, t->client_buf_len);
++	Stream_Write_UINT32(s, t->client_buf_len);
++	Stream_Write_UINT32(s, caret);
++	Stream_Write_UINT32(s, caret);
++	Stream_Write_UINT32(s, ++t->notify_op_id);
++	Stream_Write_UINT32(s, text16_len);
++	Stream_Zero(s, 44);
++	Stream_Write_UINT8(s, 0);
++	Stream_Write_UINT8(s, 0);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT32(s, text16_len);
++	if (text16_len > 0)
++		Stream_Write(s, text16, text16_len * 2);
++	Stream_Write_UINT32(s, 0xFFFFFFFF);
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT32(s, (UINT32)keystates_size);
++	Stream_Zero(s, keystates_size);
++
++	rdptext_send_pdu(t, t->s2c_channel, RDPTXT_PDU_TEXT_CHANGED,
++			 Stream_Buffer(s), len);
++	Stream_Free(s, TRUE);
++	rdptext_log(t, "TEXT_CHANGED sent (opId %u, text %u, caret %u)",
++		    t->notify_op_id, text16_len, caret);
++}
++
++static void
++	rdptext_send_geometry_changed(struct rdptext_state *t,
++				      struct weston_surface *surface)
++{
++	wStream *s;
++	pixman_box32_t bounds;
++	pixman_box32_t caret;
++	bool have_bounds;
++	bool have_caret;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 48);
++	if (!s)
++		return;
++
++	have_bounds = surface ? rdptext_get_caret_control_bounds(t, surface,
++								 &bounds) : false;
++	have_caret = surface ? rdptext_get_cursor_bounds(t, surface, &caret)
++			     : false;
++
++	Stream_Write_UINT32(s, RDPTXT_TEXT_TARGET_ID);
++	Stream_Write_UINT32(s, RDPTXT_EDIT_CONTROL_ID);
++	if (have_bounds) {
++		Stream_Write_UINT32(s, (UINT32)bounds.x1);
++		Stream_Write_UINT32(s, (UINT32)bounds.y1);
++		Stream_Write_UINT32(s, (UINT32)bounds.x2);
++		Stream_Write_UINT32(s, (UINT32)bounds.y2);
++	} else {
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++	}
++	Stream_Write_UINT32(s, 0);
++	Stream_Write_UINT32(s, 0);
++	if (have_caret) {
++		Stream_Write_UINT32(s, (UINT32)caret.x1);
++		Stream_Write_UINT32(s, (UINT32)caret.y1);
++		Stream_Write_UINT32(s, (UINT32)caret.x2);
++		Stream_Write_UINT32(s, (UINT32)caret.y2);
++	} else if (have_bounds) {
++		Stream_Write_UINT32(s, (UINT32)bounds.x1);
++		Stream_Write_UINT32(s, (UINT32)bounds.y1);
++		Stream_Write_UINT32(s, (UINT32)bounds.x2);
++		Stream_Write_UINT32(s, (UINT32)bounds.y2);
++	} else {
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++		Stream_Write_UINT32(s, 0);
++	}
++
++	rdptext_send_pdu(t, t->s2c_channel, RDPTXT_PDU_GEOMETRY_CHANGED,
++			 Stream_Buffer(s), 48);
++	Stream_Free(s, TRUE);
++	rdptext_log(t, "GEOMETRY_CHANGED sent bounds:%d caret:%d",
++		    have_bounds, have_caret);
++
++	if (have_bounds) {
++		static int32_t last_ctrl[4];
++
++		if (last_ctrl[0] != bounds.x1 || last_ctrl[1] != bounds.y1 ||
++		    last_ctrl[2] != bounds.x2 || last_ctrl[3] != bounds.y2) {
++			last_ctrl[0] = bounds.x1;
++			last_ctrl[1] = bounds.y1;
++			last_ctrl[2] = bounds.x2;
++			last_ctrl[3] = bounds.y2;
++			rdptext_send_edit_control_focus(t, true, surface);
++		}
++	}
++}
++
++static void
++	rdptext_handle_update_mode(struct rdptext_state *t, wStream *s)
++{
++	UINT32 host_id, client_id, control_id, features, trigger_len, op_id;
++	BYTE enabled;
++	struct weston_surface *surface = t->focused_surface;
++
++	if (Stream_GetRemainingLength(s) < 21)
++		return;
++
++	Stream_Read_UINT32(s, host_id);
++	Stream_Read_UINT32(s, client_id);
++	Stream_Read_UINT32(s, control_id);
++	Stream_Read_UINT32(s, features);
++	Stream_Read_UINT8(s, enabled);
++	if (Stream_GetRemainingLength(s) < 12)
++		return;
++	Stream_Seek(s, 8);
++	Stream_Read_UINT32(s, trigger_len);
++	if (Stream_GetRemainingLength(s) < (UINT64)trigger_len * 2 + 4)
++		return;
++	Stream_Seek(s, (UINT64)trigger_len * 2);
++	Stream_Read_UINT32(s, op_id);
++
++	rdptext_log(t, "UPDATE_MODE features=0x%08X enabled=%u control=%u "
++		    "op=%u", features, enabled, control_id, op_id);
++
++	if (!t->focused_surface) {
++		return;
++	}
++
++	if ((features & RDPTXT_FEATURE_PREDICTION_MODE) && enabled) {
++		rdptext_send_text_changed(t, NULL, 0);
++		rdptext_send_geometry_changed(t, surface);
++	} else if ((features & (RDPTXT_FEATURE_LAYOUT_CHANGE_TRACKING |
++				RDPTXT_FEATURE_SELECTION_TRACKING)) && enabled) {
++		rdptext_send_geometry_changed(t, surface);
++	}
++}
++
++static void
++rdptext_send_ack_remote_operation(struct rdptext_state *t,
++				  UINT32 text_input_client_id,
++				  UINT32 edit_control_id,
++				  UINT32 operation_id, UINT32 error_code)
++{
++	wStream *s;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 16);
++	if (!s)
++		return;
++	Stream_Write_UINT32(s, text_input_client_id);
++	Stream_Write_UINT32(s, edit_control_id);
++	Stream_Write_UINT32(s, operation_id);
++	Stream_Write_UINT32(s, error_code);
++
++	rdptext_send_pdu(t, t->s2c_channel,
++			 RDPTXT_PDU_ACKNOWLEDGE_REMOTE_OPERATION,
++			 Stream_Buffer(s), 16);
++	Stream_Free(s, TRUE);
++	rdptext_verbose(t, "acked remote operation %u (err %u)",
++			operation_id, error_code);
++}
++
++static void
++rdptext_send_ack_key_event(struct rdptext_state *t, UINT32 text_input_host_id,
++			   UINT32 key_event_id)
++{
++	wStream *s;
++
++	if (!rdptext_s2c_ok(t))
++		return;
++
++	s = Stream_New(NULL, 12);
++	if (!s)
++		return;
++	Stream_Write_UINT32(s, text_input_host_id);
++	Stream_Write_UINT32(s, key_event_id);
++	Stream_Write_UINT32(s, RDPTXT_KEY_ACK_COMPLETED);
++
++	rdptext_send_pdu(t, t->s2c_channel, RDPTXT_PDU_ACKNOWLEDGE_KEY_EVENT,
++			 Stream_Buffer(s), 12);
++	Stream_Free(s, TRUE);
++}
++
++static void
++rdptext_send_registrations(struct rdptext_state *t)
++{
++	if (!rdptext_s2c_ok(t) || t->registered)
++		return;
++
++	rdptext_send_register_text_target(t);
++	rdptext_send_register_key_target(t);
++	rdptext_send_register_edit_control(t);
++	rdptext_send_thread_properties(t);
++	rdptext_send_host_foreground(t);
++	rdptext_send_host_focus(t, true);
++
++	t->registered = true;
++	rdptext_log(t, "registered text target/key target/edit control");
++}
++
++static void
++rdptext_update_edit_focus(struct rdptext_state *t)
++{
++	bool active = false;
++	struct weston_surface *surface = NULL;
++	const char *android_socket = getenv("PICKLE_RDP_ANDROID_SOCKET");
++
++	/* A focused client may precede the asynchronous DVC handshake. */
++	if (!t->version_sent || !t->client_version_received ||
++	    !rdptext_channel_is_ready(t->s2c_channel))
++		return;
++
++	if (t->bridge_api && t->integration_enabled &&
++	    t->client_integration_status && t->window_input_enabled &&
++	    (t->peer_ctx->item.flags & RDP_PEER_ACTIVATED))
++		active = t->bridge_api->get_active(t->peer_ctx->rdpBackend->compositor,
++						   &surface);
++
++	/* A dedicated Android session has no native Wayland text-input-v3 client. */
++	if (!active && android_socket && *android_socket &&
++	    access(android_socket, F_OK) == 0 && t->integration_enabled &&
++	    t->client_integration_status && t->window_input_enabled &&
++	    (t->peer_ctx->item.flags & RDP_PEER_ACTIVATED))
++		active = true;
++
++	if (active && !t->registered && (surface || (android_socket && *android_socket))) {
++		/* Desktop RDP has one host window rather than per-app RAIL windows. */
++		t->window_id = RDPTXT_HOST_ID;
++		rdptext_log(t, "first text input on surface %p, desktop window "
++			    "id 0x%X; registering", (void *)surface,
++			    t->window_id);
++		rdptext_send_registrations(t);
++	}
++
++	if (active == t->focus_notified &&
++	    (!active || surface == t->focused_surface))
++		return;
++
++	if (t->focus_notified)
++		rdptext_send_edit_control_focus(t, false, NULL);
++
++	if (active) {
++		rdptext_send_edit_control_focus(t, true, surface);
++		rdptext_send_text_changed(t, NULL, 0);
++		rdptext_log(t, "edit control focused: surface %p",
++			    (void *)surface);
++	}
++
++	t->focus_notified = active;
++	t->focused_surface = active ? surface : NULL;
++}
++
++static void
++rdptext_bridge_state_cb(bool active, struct weston_surface *surface,
++			void *user_data)
++{
++	struct rdptext_state *t = user_data;
++
++	rdptext_verbose(t, "bridge state: active=%d surface=%p",
++			active, (void *)surface);
++	rdptext_update_edit_focus(t);
++}
++
++static void
++rdptext_record_commit(struct rdptext_state *t, const char *utf8)
++{
++	char *dup;
++
++	dup = strdup(utf8);
++	if (!dup)
++		return;
++
++	free(t->last_commit_text);
++	t->last_commit_text = dup;
++}
++
++static void
++rdptext_commit_text(struct rdptext_state *t, const char *utf8)
++{
++	struct rdp_backend *b = t->peer_ctx->rdpBackend;
++	const char *path = getenv("PICKLE_RDP_ANDROID_SOCKET");
++
++	if (!utf8 || !*utf8)
++		return;
++
++	if (path && *path) {
++		struct sockaddr_un addr = { .sun_family = AF_UNIX };
++		size_t length = strlen(utf8);
++		int fd;
++		ssize_t sent;
++
++		if (length > 2048 || strlen(path) >= sizeof(addr.sun_path)) {
++			rdptext_log(t, "android commit rejected: invalid length");
++			return;
++		}
++		memcpy(addr.sun_path, path, strlen(path) + 1);
++		fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++		if (fd < 0) {
++			rdptext_log(t, "android commit failed: socket unavailable");
++			return;
++		}
++		sent = sendto(fd, utf8, length, MSG_DONTWAIT,
++			      (struct sockaddr *)&addr, sizeof(addr));
++		close(fd);
++		if (sent != (ssize_t)length) {
++			rdptext_log(t, "android commit failed: receiver unavailable");
++			return;
++		}
++		rdptext_log(t, "android commit: %zu UTF-8 bytes", length);
++		rdptext_record_commit(t, utf8);
++		return;
++	}
++
++	if (!t->bridge_api) {
++		rdptext_log(t, "commit dropped: no text-input bridge");
++		return;
++	}
++
++	rdptext_log(t, "commit: %zu UTF-8 bytes", strlen(utf8));
++	t->bridge_api->send_commit(b->compositor, utf8);
++	rdptext_record_commit(t, utf8);
++}
++
++static void
++rdptext_flush_pending_commit(struct rdptext_state *t)
++{
++	if (!t->pending_commit)
++		return;
++
++	rdptext_commit_text(t, t->pending_commit);
++	free(t->pending_commit);
++	t->pending_commit = NULL;
++
++	t->skip_identical_update_text = true;
++}
++
++static void
++rdptext_set_preedit(struct rdptext_state *t, const char *utf8)
++{
++	struct rdp_backend *b = t->peer_ctx->rdpBackend;
++
++	if (getenv("PICKLE_RDP_ANDROID_SOCKET"))
++		return;
++	if (!t->bridge_api)
++		return;
++
++	t->bridge_api->send_preedit(b->compositor, utf8, -1, -1);
++	rdptext_verbose(t, "preedit: \"%s\"", utf8 ? utf8 : "");
++}
++
++static void
++rdptext_handle_update_text(struct rdptext_state *t, UINT16 pdu_id,
++			   wStream *s)
++{
++	UINT32 client_id, control_id, host_id, operation_id;
++	UINT32 replace_begin, replace_end;
++	UINT32 text_len;
++	char *utf8;
++
++	(void)pdu_id;
++	(void)host_id;
++
++	if (Stream_GetRemainingLength(s) < 28)
++		return;
++
++	Stream_Read_UINT32(s, client_id);
++	Stream_Read_UINT32(s, control_id);
++	Stream_Read_UINT32(s, host_id);
++	Stream_Read_UINT32(s, operation_id);
++	Stream_Read_UINT32(s, replace_begin);
++	Stream_Read_UINT32(s, replace_end);
++	Stream_Read_UINT32(s, text_len);
++
++	if (text_len > RDPTXT_MAX_TEXT_UNITS ||
++	    Stream_GetRemainingLength(s) < (UINT64)text_len * 2) {
++		rdptext_log(t, "UPDATE_TEXT: bad text length %u", text_len);
++		return;
++	}
++
++	utf8 = rdptext_utf16_to_utf8((const UINT16 *)Stream_Pointer(s),
++				     text_len);
++	Stream_Seek(s, text_len * 2);
++	if (!utf8)
++		return;
++
++	rdptext_verbose(t, "UPDATE_TEXT op=%u [%u,%d): \"%s\"",
++			operation_id, replace_begin, (int32_t)replace_end,
++			utf8);
++
++	if (t->skip_identical_update_text && t->last_commit_text &&
++	    strcmp(t->last_commit_text, utf8) == 0) {
++		rdptext_verbose(t, "UPDATE_TEXT: duplicate of the determined "
++				"text just committed, skipped");
++	} else {
++		rdptext_commit_text(t, utf8);
++	}
++	t->skip_identical_update_text = false;
++
++	{
++		size_t wchars = 0;
++		UINT16 *text16 = rdptext_utf8_to_utf16(utf8, &wchars);
++		if (text16)
++		{
++			rdptext_send_text_changed(t, text16,
++						  (UINT32)wchars);
++			t->client_buf_len += (UINT32)wchars;
++			free(text16);
++		}
++	}
++
++	free(t->pending_commit);
++	t->pending_commit = NULL;
++	free(utf8);
++
++	rdptext_send_ack_remote_operation(t, client_id, control_id,
++					  operation_id, 0);
++}
++
++static void
++rdptext_handle_update_composition(struct rdptext_state *t, wStream *s)
++{
++	UINT32 client_id, control_id, host_id, operation_id;
++	UINT8 composition_action;
++	UINT32 clauses_count, i;
++	wStream *composition;
++	char *utf8;
++
++	if (Stream_GetRemainingLength(s) < 21)
++		return;
++
++	Stream_Read_UINT32(s, client_id);
++	Stream_Read_UINT32(s, control_id);
++	Stream_Read_UINT32(s, host_id);
++	Stream_Read_UINT32(s, operation_id);
++	Stream_Read_UINT8(s, composition_action);
++	Stream_Read_UINT32(s, clauses_count);
++
++	rdptext_verbose(t, "UPDATE_COMPOSITION op=%u action=%u clauses=%u",
++			operation_id, composition_action, clauses_count);
++
++	if (clauses_count > RDPTXT_MAX_CLAUSES) {
++		rdptext_log(t, "UPDATE_COMPOSITION: too many clauses (%u)",
++			    clauses_count);
++		return;
++	}
++
++	composition = Stream_New(NULL, 256);
++	if (!composition)
++		return;
++
++	for (i = 0; i < clauses_count; i++) {
++		UINT32 clause_len;
++
++		if (Stream_GetRemainingLength(s) < 4)
++			goto out;
++
++		Stream_Read_UINT32(s, clause_len);
++		if (clause_len > RDPTXT_MAX_TEXT_UNITS ||
++		    Stream_GetRemainingLength(s) < (UINT64)clause_len * 2 + 8)
++			goto out;
++
++		utf8 = rdptext_utf16_to_utf8((const UINT16 *)Stream_Pointer(s),
++					     clause_len);
++		Stream_Seek(s, clause_len * 2);
++		Stream_Seek(s, 8);
++
++		if (utf8 && *utf8) {
++			if (!Stream_EnsureRemainingCapacity(composition,
++							    strlen(utf8) + 1))
++				goto out;
++			Stream_Write(composition, utf8, strlen(utf8));
++		}
++		free(utf8);
++	}
++
++	if (!Stream_EnsureRemainingCapacity(composition, 1))
++		goto out;
++	Stream_Write(composition, "", 1);
++
++	utf8 = (char *)Stream_Buffer(composition);
++
++	switch (composition_action) {
++	case RDPTXT_COMPOSITION_ENTER:
++	case RDPTXT_COMPOSITION_UPDATE:
++		t->composition_active = true;
++		t->skip_identical_update_text = false;
++		rdptext_set_preedit(t, utf8);
++		break;
++	case RDPTXT_COMPOSITION_LEAVE:
++		t->composition_active = false;
++		rdptext_flush_pending_commit(t);
++		rdptext_set_preedit(t, "");
++		break;
++	default:
++		rdptext_log(t, "UPDATE_COMPOSITION: unknown action %u",
++			    composition_action);
++		break;
++	}
++
++out:
++	Stream_Free(composition, TRUE);
++
++	if (composition_action == RDPTXT_COMPOSITION_ENTER ||
++	    composition_action == RDPTXT_COMPOSITION_LEAVE)
++		rdptext_send_ack_remote_operation(t, client_id, control_id,
++						  operation_id, 0);
++}
++
++static void
++rdptext_handle_set_composition_info(struct rdptext_state *t, wStream *s)
++{
++	UINT32 text_len;
++	char *utf8;
++
++	if (Stream_GetRemainingLength(s) < 28)
++		return;
++
++	Stream_Seek(s, 16);
++	Stream_Seek(s, 8);
++	Stream_Read_UINT32(s, text_len);
++
++	if (text_len > RDPTXT_MAX_TEXT_UNITS ||
++	    Stream_GetRemainingLength(s) < (UINT64)text_len * 2)
++		return;
++
++	utf8 = rdptext_utf16_to_utf8((const UINT16 *)Stream_Pointer(s),
++				     text_len);
++	if (!utf8)
++		return;
++
++	rdptext_verbose(t, "SET_COMPOSITION_INFO: determined \"%s\"", utf8);
++
++	free(t->pending_commit);
++	t->pending_commit = utf8;
++
++	if (!t->composition_active)
++		rdptext_flush_pending_commit(t);
++}
++
++struct rdptext_key_event_info {
++	UINT16 modifier_flags;
++	UINT16 event_flags;
++	UINT16 virtual_key;
++	UINT16 character;
++	UINT16 repeat_count;
++	UINT16 scan_code;
++	UINT8 is_extended_key;
++	UINT8 was_key_down;
++	UINT8 is_key_released;
++};
++
++static BOOL
++rdptext_read_key_event_info(wStream *s, struct rdptext_key_event_info *info)
++{
++	UINT32 event_flags2;
++
++	(void)event_flags2;
++
++	if (Stream_GetRemainingLength(s) < 44)
++		return FALSE;
++
++	Stream_Read_UINT16(s, info->modifier_flags);
++	Stream_Read_UINT16(s, info->event_flags);
++	Stream_Read_UINT32(s, event_flags2);
++	Stream_Read_UINT16(s, info->virtual_key);
++	Stream_Read_UINT16(s, info->character);
++	Stream_Seek(s, 2);
++	Stream_Seek(s, 8);
++	Stream_Read_UINT16(s, info->repeat_count);
++	Stream_Read_UINT16(s, info->scan_code);
++	Stream_Read_UINT8(s, info->is_extended_key);
++	Stream_Seek(s, 1);
++	Stream_Read_UINT8(s, info->was_key_down);
++	Stream_Read_UINT8(s, info->is_key_released);
++	Stream_Seek(s, 4);
++	Stream_Seek(s, 4);
++	Stream_Seek(s, 6);
++
++	return TRUE;
++}
++
++static void
++rdptext_inject_key(struct rdptext_state *t,
++		   const struct rdptext_key_event_info *info)
++{
++	RdpPeerContext *peer_ctx = t->peer_ctx;
++	struct weston_keyboard *keyboard;
++	uint32_t vk_code, scan_code;
++	enum wl_keyboard_key_state key_state;
++	bool send_key = false;
++	struct timespec time;
++	struct weston_key_event event;
++
++	keyboard = weston_seat_get_keyboard(peer_ctx->item.seat);
++	if (!keyboard)
++		return;
++
++	vk_code = info->virtual_key;
++	if (info->is_extended_key)
++		vk_code |= KBDEXT;
++
++	scan_code = GetKeycodeFromVirtualKeyCode(vk_code, WINPR_KEYCODE_TYPE_XKB);
++	if (scan_code == 0 || scan_code <= 8)
++		return;
++
++	if (info->event_flags & RDPTXT_KEY_FLAG_UP)
++		key_state = WL_KEYBOARD_KEY_STATE_RELEASED;
++	else
++		key_state = WL_KEYBOARD_KEY_STATE_PRESSED;
++
++	if (key_state == WL_KEYBOARD_KEY_STATE_RELEASED) {
++		uint32_t *k, *end;
++
++		end = keyboard->keys.data + keyboard->keys.size;
++		for (k = keyboard->keys.data; k < end; k++) {
++			if (*k == (scan_code - 8)) {
++				send_key = true;
++				break;
++			}
++		}
++	} else {
++		send_key = true;
++	}
++
++	if (!send_key)
++		return;
++
++	weston_compositor_get_time(&time);
++	weston_key_event_init(&event, &time, peer_ctx->item.seat,
++		scan_code - 8, key_state, STATE_UPDATE_AUTOMATIC);
++	notify_key(&event);
++	rdptext_verbose(t, "key vk=0x%x ext=%d flags=0x%x -> keycode %u %s",
++			info->virtual_key, info->is_extended_key,
++			info->event_flags, scan_code - 8,
++			key_state == WL_KEYBOARD_KEY_STATE_PRESSED ?
++			"press" : "release");
++}
++
++static void
++rdptext_handle_key_event(struct rdptext_state *t, wStream *s)
++{
++	UINT32 host_id, key_event_id, last_seen_key_event_id, control_id;
++	UINT32 key_states_size, key_text_len, key_name_text_len;
++	UINT8 routing_stage, notify_framework;
++	struct rdptext_key_event_info info = { 0 };
++
++	(void)control_id;
++	(void)last_seen_key_event_id;
++
++	if (Stream_GetRemainingLength(s) < 19)
++		return;
++
++	Stream_Read_UINT32(s, host_id);
++	Stream_Read_UINT32(s, key_event_id);
++	Stream_Read_UINT8(s, routing_stage);
++	Stream_Read_UINT32(s, last_seen_key_event_id);
++	Stream_Read_UINT32(s, control_id);
++	Stream_Read_UINT8(s, notify_framework);
++
++	if (!rdptext_read_key_event_info(s, &info))
++		return;
++
++	if (Stream_GetRemainingLength(s) < 4)
++		return;
++	Stream_Read_UINT32(s, key_states_size);
++	if (key_states_size > RDPTXT_MAX_KEYSTATS ||
++	    Stream_GetRemainingLength(s) < key_states_size)
++		return;
++	Stream_Seek(s, key_states_size);
++
++	if (Stream_GetRemainingLength(s) < 4)
++		return;
++	Stream_Read_UINT32(s, key_text_len);
++	if (key_text_len > RDPTXT_MAX_TEXT_UNITS ||
++	    Stream_GetRemainingLength(s) < (UINT64)key_text_len * 2)
++		return;
++	Stream_Seek(s, key_text_len * 2);
++
++	if (Stream_GetRemainingLength(s) < 6)
++		return;
++	Stream_Seek(s, 2);
++	Stream_Read_UINT32(s, key_name_text_len);
++	if (key_name_text_len > RDPTXT_MAX_TEXT_UNITS ||
++	    Stream_GetRemainingLength(s) < (UINT64)key_name_text_len * 2)
++		return;
++	Stream_Seek(s, key_name_text_len * 2);
++
++	rdptext_verbose(t, "KEY_EVENT id=%u stage=%u notify=%d vk=0x%x "
++			"flags=0x%x", key_event_id, routing_stage,
++			notify_framework, info.virtual_key, info.event_flags);
++
++	if (notify_framework && t->focus_notified)
++		rdptext_inject_key(t, &info);
++
++	if (routing_stage == RDPTXT_KEY_ROUTING_NONE)
++		rdptext_send_ack_key_event(t, host_id, key_event_id);
++}
++
++static void
++rdptext_handle_character_event(struct rdptext_state *t, wStream *s)
++{
++	struct rdptext_key_event_info info = { 0 };
++
++	if (Stream_GetRemainingLength(s) < 16)
++		return;
++
++	Stream_Seek(s, 16);
++	if (!rdptext_read_key_event_info(s, &info))
++		return;
++
++	rdptext_verbose(t, "CHARACTER_EVENT character=0x%x (ignored: keys "
++			"arrive via KEY_EVENT / UPDATE_TEXT)", info.character);
++}
++
++static void
++rdptext_handle_client_version(struct rdptext_state *t, wStream *s)
++{
++	if (Stream_GetRemainingLength(s) < 8)
++		return;
++
++	Stream_Read_UINT32(s, t->client_version_major);
++	Stream_Read_UINT32(s, t->client_version_minor);
++	t->client_version_received = true;
++
++	rdptext_log(t, "client text-input version %u.%u (minor is a "
++		    "capability bitmask)",
++		    t->client_version_major, t->client_version_minor);
++
++}
++
++static void
++rdptext_handle_report_client_options(struct rdptext_state *t, wStream *s)
++{
++	UINT32 options;
++
++	if (Stream_GetRemainingLength(s) < 4)
++		return;
++
++	Stream_Read_UINT32(s, options);
++	rdptext_verbose(t, "REPORT_CLIENT_OPTIONS 0x%x%s", options,
++			(options & 0x1) ? " (EnablePredictedKeyReporting)" : "");
++}
++
++static void
++rdptext_handle_remote_integration_status(struct rdptext_state *t, wStream *s)
++{
++	UINT8 enabled;
++
++	if (Stream_GetRemainingLength(s) < 1)
++		return;
++
++	Stream_Read_UINT8(s, enabled);
++	t->client_integration_status = (enabled != 0);
++
++	rdptext_log(t, "REMOTE_INTEGRATION_STATUS: %s",
++		    t->client_integration_status ? "enabled" : "disabled");
++
++	if (!t->client_integration_status && t->focus_notified) {
++		rdptext_send_edit_control_focus(t, false, NULL);
++		t->focus_notified = false;
++		t->focused_surface = NULL;
++	}
++}
++
++static void
++rdptext_handle_enable_window(struct rdptext_state *t, wStream *s)
++{
++	UINT32 host_id;
++	UINT8 input_enabled;
++
++	if (Stream_GetRemainingLength(s) < 5)
++		return;
++
++	Stream_Read_UINT32(s, host_id);
++	Stream_Read_UINT8(s, input_enabled);
++
++	if (host_id != RDPTXT_HOST_ID) {
++		rdptext_verbose(t, "ENABLE_WINDOW for unknown host %u",
++				host_id);
++		return;
++	}
++
++	t->window_input_enabled = (input_enabled != 0);
++	rdptext_log(t, "ENABLE_WINDOW: input %s",
++		    t->window_input_enabled ? "enabled" : "disabled");
++}
++
++static void
++rdptext_handle_reregistration_request(struct rdptext_state *t)
++{
++	rdptext_log(t, "REREGISTRATION_REQUEST: re-registering targets");
++	t->registered = false;
++	if (t->focus_notified) {
++		t->focus_notified = false;
++		t->focused_surface = NULL;
++	}
++	rdptext_send_registrations(t);
++	rdptext_update_edit_focus(t);
++}
++
++static void
++rdptext_handle_update_input_profile(struct rdptext_state *t, wStream *s)
++{
++	UINT32 client_id, initializing;
++	const size_t profile_size = 82;
++	BYTE profile[82];
++	UINT16 langid;
++
++	if (Stream_GetRemainingLength(s) < 4 + profile_size + 1)
++		return;
++
++	Stream_Read_UINT32(s, client_id);
++	Stream_Read(s, profile, profile_size);
++	Stream_Read_UINT8(s, initializing);
++
++	langid = (UINT16)(profile[0] | ((UINT16)profile[1] << 8));
++	rdptext_log(t, "UPDATE_INPUT_PROFILE client=%u langid=0x%04X "
++		    "initializing=%u", client_id, langid, initializing);
++
++	if (rdptext_s2c_ok(t)) {
++		wStream *r = Stream_New(NULL, 4 + profile_size);
++		if (!r)
++			return;
++		Stream_Write_UINT32(r, client_id);
++		Stream_Write(r, profile, profile_size);
++		rdptext_send_pdu(t, t->s2c_channel,
++				 RDPTXT_PDU_INPUT_PROFILE_CHANGED,
++				 Stream_Buffer(r), 4 + profile_size);
++		Stream_Free(r, TRUE);
++		rdptext_log(t, "INPUT_PROFILE_CHANGED sent (accepted client "
++			    "profile)");
++	}
++}
++
++static void
++rdptext_handle_acknowledge_operation(struct rdptext_state *t, wStream *s)
++{
++	UINT32 client_id, control_id, ack_type, operation_id;
++
++	if (Stream_GetRemainingLength(s) < 16)
++		return;
++
++	Stream_Read_UINT32(s, client_id);
++	Stream_Read_UINT32(s, control_id);
++	Stream_Read_UINT32(s, ack_type);
++	Stream_Read_UINT32(s, operation_id);
++
++	rdptext_log(t, "ACKNOWLEDGE_OPERATION type=%u client=%u control=%u "
++		    "op=%u", ack_type, client_id, control_id, operation_id);
++}
++
++static void
++rdptext_process_pdu(struct rdptext_state *t, wStream *s)
++{
++	UINT32 size, start;
++	UINT16 pdu_id;
++
++	start = Stream_GetPosition(s);
++
++	if (Stream_GetRemainingLength(s) < RDPTXT_HEADER_SIZE)
++		return;
++
++	Stream_Read_UINT32(s, size);
++	Stream_Read_UINT16(s, pdu_id);
++
++	if (size < 2 || Stream_GetRemainingLength(s) < size - 2) {
++		rdptext_log(t, "truncated PDU 0x%04X (declared size %u)", pdu_id,
++			    size);
++		rdptext_hex_dump(t, (const unsigned char *)Stream_Pointer(s) - 6,
++				 Stream_GetRemainingLength(s) + 6);
++		return;
++	}
++
++	switch (pdu_id) {
++	case RDPTXT_PDU_UPDATE_TEXT:
++	case RDPTXT_PDU_UPDATE_TEXT_AND_SELECTION:
++		rdptext_handle_update_text(t, pdu_id, s);
++		break;
++	case RDPTXT_PDU_UPDATE_COMPOSITION:
++		rdptext_handle_update_composition(t, s);
++		break;
++	case RDPTXT_PDU_SET_COMPOSITION_INFO:
++		rdptext_handle_set_composition_info(t, s);
++		break;
++	case RDPTXT_PDU_KEY_EVENT:
++		rdptext_handle_key_event(t, s);
++		break;
++	case RDPTXT_PDU_CHARACTER_EVENT:
++		rdptext_handle_character_event(t, s);
++		break;
++	case RDPTXT_PDU_NOTIFY_CLIENT_VERSION:
++		rdptext_handle_client_version(t, s);
++		break;
++	case RDPTXT_PDU_REPORT_CLIENT_OPTIONS:
++		rdptext_handle_report_client_options(t, s);
++		break;
++	case RDPTXT_PDU_REMOTE_INTEGRATION_STATUS:
++		rdptext_handle_remote_integration_status(t, s);
++		break;
++	case RDPTXT_PDU_ENABLE_WINDOW:
++		rdptext_handle_enable_window(t, s);
++		break;
++	case RDPTXT_PDU_UPDATE_INPUT_PROFILE:
++		rdptext_handle_update_input_profile(t, s);
++		break;
++	case RDPTXT_PDU_UPDATE_MODE:
++		rdptext_handle_update_mode(t, s);
++		break;
++	case RDPTXT_PDU_SET_CONVERSION_MODE:
++		rdptext_log(t, "SET_CONVERSION_MODE received (ignored)");
++		break;
++	case RDPTXT_PDU_OCCLUDING_VIEWS:
++		rdptext_log(t, "OCCLUDING_VIEWS received (ignored)");
++		break;
++	case RDPTXT_PDU_REREGISTRATION_REQUEST:
++		rdptext_handle_reregistration_request(t);
++		break;
++	case RDPTXT_PDU_ACKNOWLEDGE_OPERATION:
++	case RDPTXT_PDU_ACKNOWLEDGE_HOST_OPERATION:
++		rdptext_handle_acknowledge_operation(t, s);
++		break;
++	case RDPTXT_PDU_ERROR_REPORT:
++		rdptext_log(t, "client reported ERROR_REPORT: edit buffer out "
++			    "of sync, client resyncs itself");
++		break;
++	case RDPTXT_PDU_SET_SELECTION:
++	case RDPTXT_PDU_UPDATE_FORMAT:
++	case RDPTXT_PDU_RECONVERSION_CANDIDATES:
++		rdptext_log(t, "C2S PDU 0x%04X ignored", pdu_id);
++		break;
++	default:
++		rdptext_log(t, "UNKNOWN C2S PDU 0x%04X (%u bytes)", pdu_id,
++			    size);
++		if (Stream_GetRemainingLength(s) >= 32)
++			rdptext_hex_dump(t, Stream_Pointer(s), 32);
++		break;
++	}
++
++	{
++		UINT32 pos = Stream_GetPosition(s);
++		UINT32 end = start + 4 + size;
++
++		if (end > pos && end - pos <= Stream_GetRemainingLength(s))
++			Stream_Seek(s, end - pos);
++	}
++}
++
++static void
++rdptext_pump_c2s(struct rdptext_state *t)
++{
++	while (t->c2s_channel) {
++		ULONG read = 0;
++		wStream *s;
++
++		if (!WTSVirtualChannelRead(t->c2s_channel, 0, NULL, 0, &read))
++			break;
++		if (read == 0)
++			break;
++		if (read > RDPTXT_MAX_PDU_SIZE) {
++			rdptext_log(t, "oversized C2S message (%lu bytes), "
++				    "dropped", (unsigned long)read);
++			read = RDPTXT_MAX_PDU_SIZE;
++		}
++
++		s = Stream_New(NULL, read);
++		if (!s)
++			return;
++
++		if (!WTSVirtualChannelRead(t->c2s_channel, 0,
++					   (PCHAR)Stream_Buffer(s), read,
++					   &read) || read == 0) {
++			Stream_Free(s, TRUE);
++			break;
++		}
++		Stream_SetLength(s, read);
++
++		if (t->c2s_dump_count < 5 || t->verbose) {
++			rdptext_log(t, "C2S message #%d:", t->c2s_dump_count);
++			rdptext_hex_dump(t, Stream_Buffer(s), read);
++		}
++		t->c2s_dump_count++;
++
++		if (read >= 8) {
++			const unsigned char *b = Stream_Buffer(s);
++			UINT32 outer_len = (UINT32)b[0] | ((UINT32)b[1] << 8) |
++					   ((UINT32)b[2] << 16) |
++					   ((UINT32)b[3] << 24);
++
++			if (outer_len == read - 4) {
++				memmove(Stream_Buffer(s), Stream_Buffer(s) + 4,
++					read - 4);
++				read -= 4;
++				Stream_SetLength(s, read);
++				Stream_SetPosition(s, 0);
++			} else {
++				rdptext_log(t, "C2S outer length mismatch: "
++					    "%u vs message %lu; parsing from "
++					    "offset 0", outer_len,
++					    (unsigned long)read - 4);
++			}
++		}
++
++		while (Stream_GetRemainingLength(s) >= RDPTXT_HEADER_SIZE)
++			rdptext_process_pdu(t, s);
++
++		Stream_Free(s, TRUE);
++	}
++}
++
++static void
++rdptext_open_channels(struct rdptext_state *t)
++{
++	RdpPeerContext *peer_ctx = t->peer_ctx;
++	LPSTR p_session_id = NULL;
++	DWORD bytes_returned = 0;
++
++	t->session_id = WTS_CURRENT_SESSION;
++	if (WTSQuerySessionInformationA(peer_ctx->vcm, WTS_CURRENT_SESSION,
++					WTSSessionId, &p_session_id,
++					&bytes_returned) &&
++	    bytes_returned >= sizeof(DWORD)) {
++		t->session_id = *((DWORD *)p_session_id);
++	}
++	if (p_session_id)
++		WTSFreeMemory(p_session_id);
++
++	t->s2c_channel = WTSVirtualChannelOpenEx(t->session_id,
++						 (LPSTR)RDPTXT_CHANNEL_S2C,
++						 WTS_CHANNEL_OPTION_DYNAMIC);
++	t->c2s_channel = WTSVirtualChannelOpenEx(t->session_id,
++						 (LPSTR)RDPTXT_CHANNEL_C2S,
++						 WTS_CHANNEL_OPTION_DYNAMIC);
++
++	rdptext_log(t, "session %lu channels open: s2c=%p c2s=%p",
++		    (unsigned long)t->session_id,
++		    (void *)t->s2c_channel, (void *)t->c2s_channel);
++}
++
++int
++rdp_rdptext_init(freerdp_peer *client)
++{
++	RdpPeerContext *peer_ctx = (RdpPeerContext *)client->context;
++	struct rdp_backend *b = peer_ctx->rdpBackend;
++	struct rdptext_state *t;
++	const char *env;
++
++	assert_compositor_thread(b);
++
++	if (!peer_ctx->vcm)
++		return -1;
++
++	env = getenv("WESTON_RDPETXT");
++	if (env && strcmp(env, "0") == 0) {
++		rdptext_log(NULL, "disabled via WESTON_RDPETXT=0");
++		return -1;
++	}
++
++	t = calloc(1, sizeof(*t));
++	if (!t)
++		return -1;
++	t->peer_ctx = peer_ctx;
++	t->last_drdynvc_state = -1;
++	t->integration_enabled = true;
++	t->window_input_enabled = true;
++	t->verbose = getenv("WESTON_RDPETXT_DEBUG") != NULL;
++	if (getenv("PICKLE_RDP_ANDROID_SOCKET")) {
++		t->hangul_input = hangul_ic_new("2");
++		if (!t->hangul_input)
++			rdptext_log(t, "libhangul init failed; scancode IME disabled");
++	}
++	peer_ctx->rdptext = t;
++
++	t->bridge_api =
++		weston_plugin_api_get(b->compositor,
++				      WESTON_TEXT_INPUT_BRIDGE_API_NAME,
++				      sizeof(struct weston_text_input_bridge_api));
++	if (t->bridge_api) {
++		t->bridge_api->set_state_listener(b->compositor,
++						  rdptext_bridge_state_cb, t);
++		t->bridge_listener_attached = true;
++	} else {
++		rdptext_log(t, "text-input bridge API not available; "
++			    "was the shell initialized with "
++			    "text_backend_init()? committed text will be "
++			    "logged but not injected");
++	}
++
++	/* The core manager negotiates drdynvc after peer activation. */
++	return 0;
++}
++
++void
++rdp_rdptext_process(RdpPeerContext *peer_ctx)
++{
++	struct rdptext_state *t = peer_ctx->rdptext;
++	int drdynvc_state;
++
++	if (!t)
++		return;
++
++	drdynvc_state = WTSVirtualChannelManagerGetDrdynvcState(peer_ctx->vcm);
++	if (drdynvc_state != t->last_drdynvc_state) {
++		rdptext_log(t, "DVC manager state=%d joined=%d activated=%d",
++			    drdynvc_state,
++			    WTSVirtualChannelManagerIsChannelJoined(peer_ctx->vcm, "drdynvc"),
++			    !!(peer_ctx->item.flags & RDP_PEER_ACTIVATED));
++		t->last_drdynvc_state = drdynvc_state;
++	}
++
++	if (!t->channels_open_attempted &&
++	    WTSVirtualChannelManagerGetDrdynvcState(peer_ctx->vcm) ==
++	    DRDYNVC_STATE_READY) {
++		t->channels_open_attempted = true;
++		rdptext_open_channels(t);
++	}
++
++	if (!t->version_sent && !t->ready_failed && t->s2c_channel) {
++		if (rdptext_channel_is_ready(t->s2c_channel) &&
++		    rdptext_channel_is_ready(t->c2s_channel)) {
++			t->version_sent = TRUE;
++			rdptext_send_server_version(t);
++		} else if (++t->ready_ticks > RDPTXT_READY_TIMEOUT_TICKS) {
++			t->ready_failed = TRUE;
++			rdptext_log(t, "client never confirmed the TextInput "
++				    "DVCs; MS-RDPETXT unavailable (msrdc "
++				    "without redirecttextprocessing:i:1?)");
++		}
++	}
++
++	rdptext_pump_c2s(t);
++
++	if (t->version_sent && !t->bridge_listener_attached &&
++	    (peer_ctx->item.flags & RDP_PEER_ACTIVATED)) {
++		struct rdp_backend *b = peer_ctx->rdpBackend;
++
++		t->bridge_api =
++			weston_plugin_api_get(b->compositor,
++					      WESTON_TEXT_INPUT_BRIDGE_API_NAME,
++					      sizeof(struct weston_text_input_bridge_api));
++		if (t->bridge_api) {
++			t->bridge_api->set_state_listener(b->compositor,
++							  rdptext_bridge_state_cb,
++							  t);
++			t->bridge_listener_attached = true;
++		}
++	}
++
++	if (t->version_sent)
++		rdptext_update_edit_focus(t);
++}
++
++void
++rdp_rdptext_destroy(RdpPeerContext *peer_ctx)
++{
++	struct rdptext_state *t = peer_ctx->rdptext;
++
++	if (!t)
++		return;
++
++	if (t->bridge_api) {
++		if (t->focus_notified)
++			rdptext_send_edit_control_focus(t, false, NULL);
++		if (t->registered)
++			rdptext_send_host_focus(t, false);
++		if (t->bridge_listener_attached)
++			t->bridge_api->set_state_listener(
++				t->peer_ctx->rdpBackend->compositor, NULL, NULL);
++	}
++
++	if (t->s2c_channel)
++		WTSVirtualChannelClose(t->s2c_channel);
++	if (t->c2s_channel)
++		WTSVirtualChannelClose(t->c2s_channel);
++
++	if (t->hangul_input)
++		hangul_ic_delete(t->hangul_input);
++	free(t->pending_commit);
++	free(t->last_commit_text);
++	free(t);
++	peer_ctx->rdptext = NULL;
++}
++
++bool
++rdp_rdptext_suppress_legacy_keys(RdpPeerContext *peer_ctx)
++{
++	static int lookup_done = -1;
++	struct rdptext_state *t;
++
++	if (lookup_done < 0)
++		lookup_done = getenv("WESTON_RDPETXT_SUPPRESS_LEGACY_KEYS") ?
++			      1 : 0;
++
++	t = peer_ctx ? peer_ctx->rdptext : NULL;
++
++	return lookup_done == 1 && t && t->focus_notified;
++}
++
++static char *
++rdptext_hangul_utf8(struct rdptext_state *t, const ucschar *characters)
++{
++	UINT16 units[128];
++	size_t n = 0;
++
++	if (!characters)
++		return strdup("");
++
++	while (characters[n] && n < 127) {
++		if (characters[n] > 0xFFFF) {
++			rdptext_log(t, "invalid non-BMP Hangul composition");
++			return NULL;
++		}
++		units[n] = (UINT16)characters[n];
++		n++;
++	}
++	if (characters[n]) {
++		rdptext_log(t, "oversized Hangul composition dropped");
++		return NULL;
++	}
++	return n ? rdptext_utf16_to_utf8(units, n) : strdup("");
++}
++
++static void
++rdptext_send_hangul_state(struct rdptext_state *t,
++			   const ucschar *committed, const ucschar *preedit)
++{
++	const char *path = getenv("PICKLE_RDP_ANDROID_SOCKET");
++	char *completed = rdptext_hangul_utf8(t, committed);
++	char *composing = rdptext_hangul_utf8(t, preedit);
++	size_t clength, plength;
++	unsigned char payload[2053];
++	struct sockaddr_un addr = { .sun_family = AF_UNIX };
++	int fd;
++	ssize_t sent;
++
++	if (!completed || !composing)
++		goto done;
++	if (!getenv("PICKLE_RDP_COMPOSING_IME")) {
++		if (*completed)
++			rdptext_commit_text(t, completed);
++		goto done;
++	}
++	clength = strlen(completed);
++	plength = strlen(composing);
++	if (!path || !*path || strlen(path) >= sizeof(addr.sun_path) ||
++	    clength + plength > 2048)
++		goto done;
++	payload[0] = 1; /* Committed text + current Hangul preedit */
++	payload[1] = (unsigned char)(clength >> 8);
++	payload[2] = (unsigned char)clength;
++	payload[3] = (unsigned char)(plength >> 8);
++	payload[4] = (unsigned char)plength;
++	memcpy(payload + 5, completed, clength);
++	memcpy(payload + 5 + clength, composing, plength);
++	memcpy(addr.sun_path, path, strlen(path) + 1);
++	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++	if (fd < 0)
++		goto done;
++	sent = sendto(fd, payload, 5 + clength + plength, MSG_DONTWAIT,
++		      (struct sockaddr *)&addr, sizeof(addr));
++	close(fd);
++	if (sent == (ssize_t)(5 + clength + plength)) {
++		rdptext_log(t, "Android Hangul state: commit=%zu preedit=%zu",
++			    clength, plength);
++	} else {
++		rdptext_log(t, "Android Hangul state delivery failed");
++	}
++done:
++	free(completed);
++	free(composing);
++}
++
++static void
++rdptext_delete_android_char(struct rdptext_state *t)
++{
++	const char *path = getenv("PICKLE_RDP_ANDROID_SOCKET");
++	struct sockaddr_un addr = { .sun_family = AF_UNIX };
++	const char request = 2;
++	int fd;
++
++	if (!path || !*path || strlen(path) >= sizeof(addr.sun_path))
++		return;
++	memcpy(addr.sun_path, path, strlen(path) + 1);
++	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++	if (fd < 0)
++		return;
++	if (sendto(fd, &request, 1, MSG_DONTWAIT,
++		   (struct sockaddr *)&addr, sizeof(addr)) != 1)
++		rdptext_log(t, "Android backspace delivery failed");
++	close(fd);
++}
++
++static void
++rdptext_flush_hangul(struct rdptext_state *t)
++{
++	const ucschar *committed;
++
++	if (!t->hangul_input)
++		return;
++	committed = hangul_ic_flush(t->hangul_input);
++	rdptext_send_hangul_state(t, committed,
++				  hangul_ic_get_preedit_string(t->hangul_input));
++}
++
++
++/* Printable keys use the same FIFO as Hangul preedit; a raw Wayland
++ * scancode would otherwise overtake the asynchronous Android IME commit.
++ * shortcut: US 2-beolsik punctuation layout; other layouts need layout lookup.
++ */
++static char
++rdptext_ascii_key(UINT32 key, bool shifted)
++{
++	static const char shifted_digits[] = ")!@#$%^&*(";
++
++	if (key >= '0' && key <= '9')
++		return shifted ? shifted_digits[key - '0'] : (char)key;
++	if (key >= VK_NUMPAD0 && key <= VK_NUMPAD9)
++		return (char)('0' + key - VK_NUMPAD0);
++
++	switch (key) {
++	case VK_OEM_1: return shifted ? ':' : ';';
++	case VK_OEM_PLUS: return shifted ? '+' : '=';
++	case VK_OEM_COMMA: return shifted ? '<' : ',';
++	case VK_OEM_MINUS: return shifted ? '_' : '-';
++	case VK_OEM_PERIOD: return shifted ? '>' : '.';
++	case VK_OEM_2: return shifted ? '?' : '/';
++	case VK_OEM_3: return shifted ? '~' : '\x60';
++	case VK_OEM_4: return shifted ? '{' : '[';
++	case VK_OEM_5: return shifted ? '|' : '\\';
++	case VK_OEM_6: return shifted ? '}' : ']';
++	case VK_OEM_7: return shifted ? '"' : '\'';
++	case VK_OEM_102: return shifted ? '>' : '<';
++	case VK_MULTIPLY: return '*';
++	case VK_ADD: return '+';
++	case VK_SEPARATOR: return ',';
++	case VK_SUBTRACT: return '-';
++	case VK_DECIMAL: return '.';
++	case VK_DIVIDE: return '/';
++	default: return 0;
++	}
++}
++
++/* For Enter/navigation, send a Windows VK packet to the same Android
++ * input queue instead of racing it through the Wayland keyboard path.
++ */
++static void
++rdptext_send_android_key(struct rdptext_state *t, UINT32 vk)
++{
++	const char *path = getenv("PICKLE_RDP_ANDROID_SOCKET");
++	struct sockaddr_un addr = { .sun_family = AF_UNIX };
++	unsigned char command[2] = { 3, (unsigned char)vk };
++	int fd;
++
++	if (!path || !*path || strlen(path) >= sizeof(addr.sun_path) ||
++	    vk > UINT8_MAX)
++		return;
++	memcpy(addr.sun_path, path, strlen(path) + 1);
++	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++	if (fd < 0)
++		return;
++	if (sendto(fd, command, sizeof(command), MSG_DONTWAIT,
++		   (struct sockaddr *)&addr, sizeof(addr)) != sizeof(command))
++		rdptext_log(t, "Android special key delivery failed");
++	close(fd);
++}
++
++/* Server-side Korean keyboard for scan-code-only RDP clients.
++ * Shift+Space is the fallback if the client eats VK_HANGUL.
++ */
++bool
++rdp_rdptext_scancode_key(RdpPeerContext *peer_ctx, UINT16 flags,
++			 UINT32 virtual_key, bool korean_layout)
++{
++	struct rdptext_state *t = peer_ctx->rdptext;
++	UINT32 vk = virtual_key & ~KBDEXT;
++	bool pressed = !(flags & KBD_FLAGS_RELEASE);
++	bool extended = (virtual_key & KBDEXT) || (flags & KBD_FLAGS_EXTENDED);
++	bool toggle;
++
++	if (!t || !t->hangul_input || t->focus_notified)
++		return false;
++	/* Do not steal ordinary scancodes when the Android input bridge is down. */
++	{
++		const char *path = getenv("PICKLE_RDP_ANDROID_SOCKET");
++		if (!path || access(path, F_OK) != 0)
++			return false;
++	}
++
++	if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) {
++		t->shift_down = pressed;
++		return false;
++	}
++	if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) {
++		t->ctrl_down = pressed;
++		return false;
++	}
++
++	toggle = vk == VK_HANGUL ||
++		 (korean_layout && extended &&
++		  (vk == VK_MENU || vk == VK_RMENU));
++	if (toggle) {
++		if (pressed) {
++			rdptext_flush_hangul(t);
++			t->hangul_mode = !t->hangul_mode;
++			hangul_ic_reset(t->hangul_input);
++			rdptext_log(t, "server Hangul mode %s",
++				    t->hangul_mode ? "ON" : "OFF");
++		}
++		return true;
++	}
++
++	if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) {
++		t->alt_down = pressed;
++		return false;
++	}
++
++	if (vk == VK_SPACE) {
++		if (!pressed && t->space_toggle_owned) {
++			t->space_toggle_owned = false;
++			return true;
++		}
++		if (pressed && t->shift_down && !t->ctrl_down && !t->alt_down) {
++			rdptext_flush_hangul(t);
++			t->hangul_mode = !t->hangul_mode;
++			hangul_ic_reset(t->hangul_input);
++			t->space_toggle_owned = true;
++			rdptext_log(t, "server Hangul mode %s (Shift+Space)",
++				    t->hangul_mode ? "ON" : "OFF");
++			return true;
++		}
++		if (t->ctrl_down || t->alt_down)
++			return false;
++		if (pressed) {
++			if (t->hangul_mode)
++				rdptext_flush_hangul(t);
++			rdptext_commit_text(t, " ");
++			t->space_toggle_owned = true;
++		}
++		return true;
++	}
++
++	if (t->ctrl_down || t->alt_down)
++		return false;
++
++	if (vk == VK_BACK) {
++		if (!pressed) {
++			bool owned = t->backspace_owned;
++			t->backspace_owned = false;
++			return owned;
++		}
++		if (t->hangul_mode &&
++		    hangul_ic_backspace(t->hangul_input)) {
++			rdptext_send_hangul_state(t, NULL,
++					hangul_ic_get_preedit_string(t->hangul_input));
++		} else {
++			/* Serialize deletion with preedit updates on the IME relay. */
++			rdptext_delete_android_char(t);
++		}
++		t->backspace_owned = true;
++		return true;
++	}
++
++	if (vk >= 'A' && vk <= 'Z') {
++		if (pressed) {
++			int ascii = (int)vk + (t->shift_down ? 0 : ('a' - 'A'));
++			if (!t->hangul_mode ||
++			    !hangul_ic_process(t->hangul_input, ascii)) {
++				char text[2] = { (char)ascii, 0 };
++				if (t->hangul_mode)
++					rdptext_flush_hangul(t);
++				rdptext_commit_text(t, text);
++			} else {
++				rdptext_send_hangul_state(t,
++						hangul_ic_get_commit_string(t->hangul_input),
++						hangul_ic_get_preedit_string(t->hangul_input));
++			}
++		}
++		return true;
++	}
++
++	{
++		char ascii = rdptext_ascii_key(vk, t->shift_down);
++
++		if (ascii) {
++			if (pressed) {
++				char text[2] = { ascii, 0 };
++				if (t->hangul_mode)
++					rdptext_flush_hangul(t);
++				rdptext_commit_text(t, text);
++			}
++			return true;
++		}
++	}
++	switch (vk) {
++	case VK_RETURN:
++	case VK_TAB:
++	case VK_LEFT:
++	case VK_RIGHT:
++	case VK_UP:
++	case VK_DOWN:
++	case VK_HOME:
++	case VK_END:
++	case VK_DELETE:
++	case VK_PRIOR:
++	case VK_NEXT:
++	case VK_ESCAPE:
++		if (pressed) {
++			if (t->hangul_mode)
++				rdptext_flush_hangul(t);
++			rdptext_send_android_key(t, vk);
++		}
++		return true;
++	default:
++		if (pressed && t->hangul_mode)
++			rdptext_flush_hangul(t);
++		return false;
++	}
++}
++
++/* Reuse the same text-input bridge for ordinary RDP Unicode keyboard events. */
++void
++rdp_rdptext_unicode_key(RdpPeerContext *peer_ctx, UINT16 flags, UINT16 code)
++{
++	struct rdptext_state *t = peer_ctx->rdptext;
++	UINT16 units[2];
++	size_t count = 1;
++	char *utf8;
++
++	if (!t || flags & KBD_FLAGS_RELEASE)
++		return;
++	if (code >= 0xD800 && code <= 0xDBFF) {
++		t->unicode_high_surrogate = code;
++		return;
++	}
++	if (t->unicode_high_surrogate) {
++		units[0] = t->unicode_high_surrogate;
++		units[1] = code;
++		count = 2;
++		t->unicode_high_surrogate = 0;
++	} else {
++		units[0] = code;
++	}
++	utf8 = rdptext_utf16_to_utf8(units, count);
++	if (!utf8)
++		return;
++	if (t->hangul_input && t->hangul_mode)
++		rdptext_flush_hangul(t);
++	rdptext_commit_text(t, utf8);
++	free(utf8);
++}
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/libweston/compositor.c pickle-rdp-live/weston-16.0.2/libweston/compositor.c
+--- _release-upstream/weston-16.0.2/libweston/compositor.c	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/libweston/compositor.c	2026-11-22 05:51:56.801857004 +0000
+@@ -6472,13 +6472,15 @@
+ 	return 0;
+ }
+ 
+-static void
+-weston_global_destroy_save(struct weston_compositor *compositor,
++/* Allow queued binds after removal to create inert resources. */
++WL_EXPORT void
++weston_global_destroy_safe(struct weston_compositor *compositor,
+ 			   struct wl_global *global)
+ {
+ 	struct weston_destroy_global_data *data;
+ 	struct wl_event_loop *loop;
+ 
++	wl_global_set_user_data(global, NULL);
+ 	if (compositor->state == WESTON_COMPOSITOR_OFFSCREEN) {
+ 		wl_global_destroy(global);
+ 		return;
+@@ -6512,7 +6514,7 @@
+ 
+ 	if (head->global) {
+ 		wl_global_set_user_data(head->global, NULL);
+-		weston_global_destroy_save(head->compositor, head->global);
++		weston_global_destroy_safe(head->compositor, head->global);
+ 	}
+ 	head->global = NULL;
+ 
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/libweston/input.c pickle-rdp-live/weston-16.0.2/libweston/input.c
+--- _release-upstream/weston-16.0.2/libweston/input.c	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/libweston/input.c	2026-11-22 10:13:57.188387244 +0000
+@@ -3625,6 +3625,12 @@
+ 	if (pointer->focus_serial - serial > UINT32_MAX / 2)
+ 		return;
+ 
++	if (getenv("PICKLE_RDP_LOCAL_CURSOR")) {
++		if (pointer->sprite)
++			pointer_unmap_sprite(pointer);
++		return;
++	}
++
+ 	if (!surface) {
+ 		if (pointer->sprite)
+ 			pointer_unmap_sprite(pointer);
+@@ -3913,9 +3919,18 @@
+ 
+ 	resource = wl_resource_create(client,
+ 				      &wl_seat_interface, version, id);
+-	wl_list_insert(&seat->base_resource_list, wl_resource_get_link(resource));
++	if (!resource) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++	wl_list_init(wl_resource_get_link(resource));
+ 	wl_resource_set_implementation(resource, &seat_interface, data,
+ 				       unbind_resource);
++	if (!seat) {
++		wl_seat_send_capabilities(resource, 0);
++		return;
++	}
++	wl_list_insert(&seat->base_resource_list, wl_resource_get_link(resource));
+ 
+ 	if (version >= WL_SEAT_NAME_SINCE_VERSION)
+ 		wl_seat_send_name(resource, seat->seat_name);
+@@ -4446,7 +4461,7 @@
+ 
+ 	free (seat->seat_name);
+ 
+-	wl_global_destroy(seat->global);
++	weston_global_destroy_safe(seat->compositor, seat->global);
+ 
+ 	wl_signal_emit(&seat->destroy_signal, seat);
+ }
+diff -ruN '--exclude=.wraplock' '--exclude=display-info' '--exclude=edid-decode' '--exclude=edid-decode.wrap' _release-upstream/weston-16.0.2/protocol/meson.build pickle-rdp-live/weston-16.0.2/protocol/meson.build
+--- _release-upstream/weston-16.0.2/protocol/meson.build	2026-10-26 09:24:09.000000000 +0000
++++ pickle-rdp-live/weston-16.0.2/protocol/meson.build	2026-11-22 05:47:07.759432171 +0000
+@@ -36,6 +36,7 @@
+ 	[ 'tearing-control', 'staging', 'v1' ],
+ 	[ 'text-cursor-position', 'internal' ],
+ 	[ 'text-input', 'unstable', 'v1' ],
++	[ 'text-input', 'unstable', 'v3' ],
+ 	[ 'viewporter', 'stable' ],
+ 	[ 'weston-debug', 'internal' ],
+ 	[ 'weston-desktop-shell', 'internal' ],

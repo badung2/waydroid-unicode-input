@@ -1,0 +1,24 @@
+# Never commit generated credentials or private signing material.
+**/credentials.json
+**/users.sam
+**/tls.key
+**/tls.crt
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*signing.pass
+**/first-login.txt
+**/previous-ime.json
+**/adbkey*
+**/.env
+**/__pycache__/
+**/*.pyc
+_build/
+_dest/
+*.log
+*.tmp
+*.bak
+*.rdp
+*.zip
